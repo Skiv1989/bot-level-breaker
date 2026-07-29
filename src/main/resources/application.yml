@@ -1,0 +1,9 @@
+spring:
+  application:
+    name: binance-futures-level-breakout-bot
+  lifecycle:
+    timeout-per-shutdown-phase: 10s
+
+server:
+  shutdown: graceful
+
