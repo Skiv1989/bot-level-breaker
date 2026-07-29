@@ -76,10 +76,16 @@ class RuntimeLifecycleIntegrationTest {
         )
             .web(WebApplicationType.REACTIVE)
             .properties(
-                "server.port=0",
                 "spring.main.banner-mode=off",
             )
-            .run()
+            .run(
+                "--server.port=0",
+                "--server.ssl.enabled=false",
+                "--server.ssl.key-store=classpath:unused-test-keystore.p12",
+                "--server.ssl.key-store-password=unused-test-keystore-password",
+                "--bot.security.username=lifecycle-test-operator",
+                "--bot.security.password=lifecycle-test-password",
+            )
 }
 
 @TestConfiguration(proxyBeanMethods = false)

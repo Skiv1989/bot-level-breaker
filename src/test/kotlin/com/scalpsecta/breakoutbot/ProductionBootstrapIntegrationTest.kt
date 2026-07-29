@@ -14,10 +14,16 @@ class ProductionBootstrapIntegrationTest {
         val context = SpringApplicationBuilder(BreakoutBotApplication::class.java)
             .web(WebApplicationType.REACTIVE)
             .properties(
-                "server.port=0",
                 "spring.main.banner-mode=off",
             )
-            .run()
+            .run(
+                "--server.port=0",
+                "--server.ssl.enabled=false",
+                "--server.ssl.key-store=classpath:unused-test-keystore.p12",
+                "--server.ssl.key-store-password=unused-test-keystore-password",
+                "--bot.security.username=bootstrap-test-operator",
+                "--bot.security.password=bootstrap-test-password",
+            )
 
         try {
             assertThat(context.getBean(BinanceGateway::class.java))

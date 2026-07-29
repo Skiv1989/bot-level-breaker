@@ -5,5 +5,15 @@ spring:
     timeout-per-shutdown-phase: 10s
 
 server:
+  port: 443
   shutdown: graceful
+  ssl:
+    enabled: true
+    key-store: "file:${TLS_KEYSTORE_PATH}"
+    key-store-password: "${TLS_KEYSTORE_PASSWORD}"
+    key-store-type: PKCS12
 
+bot:
+  security:
+    username: "${BOT_BASIC_USERNAME}"
+    password: "${BOT_BASIC_PASSWORD}"
