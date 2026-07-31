@@ -85,6 +85,7 @@ class OperatorSecurityIntegrationTest {
             assertThat(Instant.parse(snapshot["startedAt"].asText())).isBeforeOrEqualTo(Instant.now())
             assertThat(snapshot["health"]["publicDataReadiness"].asText())
                 .isEqualTo("NOT_READY")
+            assertThat(snapshot["publicMarketData"]).isEmpty()
             assertThat(snapshot["health"]["privateStreamReadiness"].asText())
                 .isEqualTo("NOT_READY")
             assertThat(snapshot["health"]["tradingReadiness"].asText())

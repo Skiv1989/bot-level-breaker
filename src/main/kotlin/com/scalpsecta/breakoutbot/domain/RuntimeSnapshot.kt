@@ -1,11 +1,13 @@
 package com.scalpsecta.breakoutbot.domain
 
+import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import java.time.Instant
 
 data class RuntimeSnapshot(
     val startedAt: Instant,
     val levelCount: Int,
     val recoveredAttemptCount: Int,
+    val publicMarketData: List<PublicMarketDataSnapshot>,
     val health: RuntimeHealth,
 )
 
