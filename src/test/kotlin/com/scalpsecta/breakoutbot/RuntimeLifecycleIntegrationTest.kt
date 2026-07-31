@@ -51,6 +51,8 @@ class RuntimeLifecycleIntegrationTest {
 
             assertThat(health.publicDataReadiness).isEqualTo(BinanceReadiness.NOT_READY)
             assertThat(health.privateStreamReadiness).isEqualTo(BinanceReadiness.NOT_READY)
+            assertThat(health.clockReadiness).isEqualTo(BinanceReadiness.NOT_READY)
+            assertThat(health.accountReadiness).isEqualTo(BinanceReadiness.NOT_READY)
             assertThat(health.tradingReadiness).isEqualTo(TradingReadiness.BLOCKED)
         } finally {
             context.close()
@@ -85,6 +87,7 @@ class RuntimeLifecycleIntegrationTest {
                 "--server.ssl.key-store-password=unused-test-keystore-password",
                 "--bot.security.username=lifecycle-test-operator",
                 "--bot.security.password=lifecycle-test-password",
+                "--bot.binance.startup-enabled=false",
             )
 }
 

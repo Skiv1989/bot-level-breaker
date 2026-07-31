@@ -1,6 +1,8 @@
 package com.scalpsecta.breakoutbot
 
+import com.scalpsecta.breakoutbot.binance.AuthenticatedBinanceClient
 import com.scalpsecta.breakoutbot.binance.BinanceGateway
+import com.scalpsecta.breakoutbot.binance.LiveAuthenticatedBinanceClient
 import com.scalpsecta.breakoutbot.binance.UnavailableBinanceGateway
 import com.scalpsecta.starter.service.binance.rest.BinanceMarketDataServiceFutures
 import org.assertj.core.api.Assertions.assertThat
@@ -23,11 +25,14 @@ class ProductionBootstrapIntegrationTest {
                 "--server.ssl.key-store-password=unused-test-keystore-password",
                 "--bot.security.username=bootstrap-test-operator",
                 "--bot.security.password=bootstrap-test-password",
+                "--bot.binance.startup-enabled=false",
             )
 
         try {
             assertThat(context.getBean(BinanceGateway::class.java))
                 .isInstanceOf(UnavailableBinanceGateway::class.java)
+            assertThat(context.getBean(AuthenticatedBinanceClient::class.java))
+                .isInstanceOf(LiveAuthenticatedBinanceClient::class.java)
             assertThat(
                 context.getBeansOfType(BinanceMarketDataServiceFutures::class.java),
             ).isEmpty()

@@ -88,8 +88,26 @@ class OperatorSecurityIntegrationTest {
             assertThat(snapshot["publicMarketData"]).isEmpty()
             assertThat(snapshot["health"]["privateStreamReadiness"].asText())
                 .isEqualTo("NOT_READY")
+            assertThat(snapshot["health"]["clockReadiness"].asText())
+                .isEqualTo("NOT_READY")
+            assertThat(snapshot["health"]["accountReadiness"].asText())
+                .isEqualTo("NOT_READY")
             assertThat(snapshot["health"]["tradingReadiness"].asText())
                 .isEqualTo("BLOCKED")
+            assertThat(
+                snapshot["authenticatedBinance"]["clock"]["readiness"].asText(),
+            ).isEqualTo("NOT_READY")
+            assertThat(
+                snapshot["authenticatedBinance"]["account"]["readiness"].asText(),
+            ).isEqualTo("NOT_READY")
+            assertThat(
+                snapshot["authenticatedBinance"]["privateStream"]["readiness"].asText(),
+            ).isEqualTo("NOT_READY")
+            assertThat(snapshot["authenticatedBinance"]["currentEquity"].isNull)
+                .isTrue()
+            assertThat(
+                snapshot["authenticatedBinance"]["temporaryDailyAnchorEquity"].isNull,
+            ).isTrue()
             assertThat(response.body()).doesNotContainCredentials()
         }
     }
@@ -154,6 +172,7 @@ class OperatorSecurityIntegrationTest {
                 "--server.ssl.key-store-type=PKCS12",
                 "--bot.security.username=$OPERATOR_USERNAME",
                 "--bot.security.password=$OPERATOR_PASSWORD",
+                "--bot.binance.startup-enabled=false",
             )
 
         try {

@@ -11,21 +11,42 @@ import java.time.Instant
 @Service
 class BotStateService(
     private val publicMarketDataService: PublicMarketDataService,
+    private val authenticatedBinanceReadinessService:
+        AuthenticatedBinanceReadinessService,
 ) {
     private val startedAt = Instant.now()
 
     fun currentState(): RuntimeSnapshot {
         val publicMarketData = publicMarketDataService.snapshots()
+        val publicDataReadiness =
+            publicMarketDataService.readiness(publicMarketData)
+        val authenticatedBinance =
+            authenticatedBinanceReadinessService.snapshot()
+        val privateStreamReadiness =
+            authenticatedBinance.privateStream.readiness
+        val clockReadiness = authenticatedBinance.clock.readiness
+        val accountReadiness = authenticatedBinance.account.readiness
         return RuntimeSnapshot(
             startedAt = startedAt,
             levelCount = 0,
             recoveredAttemptCount = 0,
             publicMarketData = publicMarketData,
+            authenticatedBinance = authenticatedBinance,
             health = RuntimeHealth(
-                publicDataReadiness =
-                    publicMarketDataService.readiness(publicMarketData),
-                privateStreamReadiness = BinanceReadiness.NOT_READY,
-                tradingReadiness = TradingReadiness.BLOCKED,
+                publicDataReadiness = publicDataReadiness,
+                privateStreamReadiness = privateStreamReadiness,
+                clockReadiness = clockReadiness,
+                accountReadiness = accountReadiness,
+                tradingReadiness = if (
+                    publicDataReadiness == BinanceReadiness.READY &&
+                    privateStreamReadiness == BinanceReadiness.READY &&
+                    clockReadiness == BinanceReadiness.READY &&
+                    accountReadiness == BinanceReadiness.READY
+                ) {
+                    TradingReadiness.READY
+                } else {
+                    TradingReadiness.BLOCKED
+                },
             ),
         )
     }

@@ -1,5 +1,6 @@
 package com.scalpsecta.breakoutbot.domain
 
+import com.scalpsecta.breakoutbot.binance.AuthenticatedBinanceSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import java.time.Instant
 
@@ -8,12 +9,15 @@ data class RuntimeSnapshot(
     val levelCount: Int,
     val recoveredAttemptCount: Int,
     val publicMarketData: List<PublicMarketDataSnapshot>,
+    val authenticatedBinance: AuthenticatedBinanceSnapshot,
     val health: RuntimeHealth,
 )
 
 data class RuntimeHealth(
     val publicDataReadiness: BinanceReadiness,
     val privateStreamReadiness: BinanceReadiness,
+    val clockReadiness: BinanceReadiness,
+    val accountReadiness: BinanceReadiness,
     val tradingReadiness: TradingReadiness,
 ) {
     companion object {
@@ -21,6 +25,8 @@ data class RuntimeHealth(
             RuntimeHealth(
                 publicDataReadiness = BinanceReadiness.NOT_READY,
                 privateStreamReadiness = BinanceReadiness.NOT_READY,
+                clockReadiness = BinanceReadiness.NOT_READY,
+                accountReadiness = BinanceReadiness.NOT_READY,
                 tradingReadiness = TradingReadiness.BLOCKED,
             )
     }
