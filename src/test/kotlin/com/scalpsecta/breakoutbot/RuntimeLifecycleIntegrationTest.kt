@@ -34,6 +34,7 @@ class RuntimeLifecycleIntegrationTest {
 
             assertThat(snapshot.startedAt).isAfter(firstStartedAt)
             assertThat(snapshot.levelCount).isZero()
+            assertThat(snapshot.levels).isEmpty()
             assertThat(snapshot.recoveredAttemptCount).isZero()
         } finally {
             secondContext.close()

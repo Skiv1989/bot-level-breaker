@@ -30,6 +30,17 @@ interface AuthenticatedBinanceClient {
 
     fun commissionRate(symbol: String): Mono<BinanceCommissionRate>
 
+    fun markPrice(symbol: String): Mono<BigDecimal>
+
+    fun symbolConfiguration(symbol: String): Mono<BinanceSymbolConfiguration>
+
+    fun changeMarginType(
+        symbol: String,
+        marginType: BinanceMarginType,
+    ): Mono<Void>
+
+    fun changeInitialLeverage(symbol: String, leverage: Int): Mono<Void>
+
     fun startUserDataStream(): Mono<String>
 
     fun keepAliveUserDataStream(listenKey: String): Mono<Void>
@@ -199,6 +210,78 @@ class LiveAuthenticatedBinanceClient(
         }
     }
 
+    override fun markPrice(symbol: String): Mono<BigDecimal> {
+        val normalizedSymbol = normalizedSymbol(symbol)
+        return requestJson(
+            method = HttpMethod.GET,
+            path = "$MARK_PRICE_PATH?symbol=${urlEncode(normalizedSymbol)}",
+            sanitizedPath = MARK_PRICE_PATH,
+        ).map { payload -> payload.requiredDecimal("markPrice") }
+    }
+
+    override fun symbolConfiguration(
+        symbol: String,
+    ): Mono<BinanceSymbolConfiguration> {
+        val normalizedSymbol = normalizedSymbol(symbol)
+        return signedGet(
+            path = SYMBOL_CONFIGURATION_PATH,
+            parameters = linkedMapOf("symbol" to normalizedSymbol),
+        ).map { payload ->
+            val configuration = if (payload.isArray) {
+                payload.firstOrNull { candidate ->
+                    candidate.requiredText("symbol") == normalizedSymbol
+                } ?: throw BinanceClientException(
+                    "Binance returned no symbol configuration for $normalizedSymbol",
+                )
+            } else {
+                payload
+            }
+            BinanceSymbolConfiguration(
+                symbol = configuration.requiredText("symbol"),
+                marginType = parseMarginType(
+                    configuration.requiredText("marginType"),
+                ),
+                autoAddMargin = configuration.requiredBoolean("isAutoAddMargin"),
+                leverage = configuration.requiredInt("leverage"),
+                maximumNotional =
+                    configuration.requiredDecimal("maxNotionalValue"),
+            )
+        }
+    }
+
+    override fun changeMarginType(
+        symbol: String,
+        marginType: BinanceMarginType,
+    ): Mono<Void> {
+        val normalizedSymbol = normalizedSymbol(symbol)
+        return signedRequest(
+            method = HttpMethod.POST,
+            path = MARGIN_TYPE_PATH,
+            parameters = linkedMapOf(
+                "symbol" to normalizedSymbol,
+                "marginType" to marginType.name,
+            ),
+        ).then()
+    }
+
+    override fun changeInitialLeverage(
+        symbol: String,
+        leverage: Int,
+    ): Mono<Void> {
+        require(leverage in 1..MAX_BINANCE_LEVERAGE) {
+            "leverage must be between 1 and $MAX_BINANCE_LEVERAGE"
+        }
+        val normalizedSymbol = normalizedSymbol(symbol)
+        return signedRequest(
+            method = HttpMethod.POST,
+            path = LEVERAGE_PATH,
+            parameters = linkedMapOf(
+                "symbol" to normalizedSymbol,
+                "leverage" to leverage.toString(),
+            ),
+        ).then()
+    }
+
     override fun startUserDataStream(): Mono<String> =
         apiKeyRequest(HttpMethod.POST, LISTEN_KEY_PATH)
             .map { payload -> payload.requiredText("listenKey") }
@@ -217,6 +300,12 @@ class LiveAuthenticatedBinanceClient(
     private fun signedGet(
         path: String,
         parameters: LinkedHashMap<String, String> = linkedMapOf(),
+    ): Mono<JsonNode> = signedRequest(HttpMethod.GET, path, parameters)
+
+    private fun signedRequest(
+        method: HttpMethod,
+        path: String,
+        parameters: LinkedHashMap<String, String> = linkedMapOf(),
     ): Mono<JsonNode> =
         Mono.defer {
             val credentials = credentialsProvider.credentials()
@@ -227,7 +316,7 @@ class LiveAuthenticatedBinanceClient(
             val query = encodeQuery(signedParameters)
             val signature = BinanceRequestSigner(credentials.secret).sign(query)
             requestJson(
-                method = HttpMethod.GET,
+                method = method,
                 path = "$path?$query&signature=$signature",
                 apiKey = credentials.apiKey,
                 sanitizedPath = path,
@@ -312,7 +401,9 @@ class LiveAuthenticatedBinanceClient(
             },
             lotSizeFilter = filters[LOT_SIZE]?.toLotSizeFilter(),
             marketLotSizeFilter = filters[MARKET_LOT_SIZE]?.toLotSizeFilter(),
-            minimumNotional = filters[MIN_NOTIONAL]?.requiredDecimal("notional"),
+            minimumNotional =
+                filters[MIN_NOTIONAL]?.requiredDecimal("notional")
+                    ?: filters[NOTIONAL]?.requiredDecimal("minNotional"),
         )
     }
 
@@ -341,6 +432,15 @@ class LiveAuthenticatedBinanceClient(
             require(normalized.isNotEmpty()) {
                 "symbol must not be blank"
             }
+        }
+
+    private fun parseMarginType(value: String): BinanceMarginType =
+        when (value.uppercase()) {
+            "ISOLATED" -> BinanceMarginType.ISOLATED
+            "CROSSED", "CROSS" -> BinanceMarginType.CROSSED
+            else -> throw BinanceClientException(
+                "Binance returned an unsupported margin type",
+            )
         }
 }
 
@@ -390,6 +490,10 @@ private const val ASSET_MODE_PATH = "/fapi/v1/multiAssetsMargin"
 private const val EXCHANGE_INFO_PATH = "/fapi/v1/exchangeInfo"
 private const val LEVERAGE_BRACKET_PATH = "/fapi/v1/leverageBracket"
 private const val COMMISSION_RATE_PATH = "/fapi/v1/commissionRate"
+private const val MARK_PRICE_PATH = "/fapi/v1/premiumIndex"
+private const val SYMBOL_CONFIGURATION_PATH = "/fapi/v1/symbolConfig"
+private const val MARGIN_TYPE_PATH = "/fapi/v1/marginType"
+private const val LEVERAGE_PATH = "/fapi/v1/leverage"
 private const val LISTEN_KEY_PATH = "/fapi/v1/listenKey"
 private const val BINANCE_API_KEY_HEADER = "X-MBX-APIKEY"
 private const val BINANCE_API_KEY_VARIABLE = "BINANCE_API_KEY"
@@ -400,6 +504,8 @@ private const val PRICE_FILTER = "PRICE_FILTER"
 private const val LOT_SIZE = "LOT_SIZE"
 private const val MARKET_LOT_SIZE = "MARKET_LOT_SIZE"
 private const val MIN_NOTIONAL = "MIN_NOTIONAL"
+private const val NOTIONAL = "NOTIONAL"
+private const val MAX_BINANCE_LEVERAGE = 125
 
 internal fun liveBinanceWebClient(builder: WebClient.Builder): WebClient =
     builder

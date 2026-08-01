@@ -1,16 +1,39 @@
 package com.scalpsecta.breakoutbot
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.scalpsecta.breakoutbot.binance.AuthenticatedBinanceClient
+import com.scalpsecta.breakoutbot.binance.BinanceAccountSummary
+import com.scalpsecta.breakoutbot.binance.BinanceAssetMode
+import com.scalpsecta.breakoutbot.binance.BinanceClockMeasurement
+import com.scalpsecta.breakoutbot.binance.BinanceCommissionRate
+import com.scalpsecta.breakoutbot.binance.BinanceExchangeInfo
+import com.scalpsecta.breakoutbot.binance.BinanceLeverageBracket
+import com.scalpsecta.breakoutbot.binance.BinanceLotSizeFilter
+import com.scalpsecta.breakoutbot.binance.BinanceMarginType
+import com.scalpsecta.breakoutbot.binance.BinancePositionMode
+import com.scalpsecta.breakoutbot.binance.BinancePriceFilter
+import com.scalpsecta.breakoutbot.binance.BinanceSymbolConfiguration
+import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
+import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
+import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
+import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
+import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataStreamProvider
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
 import org.junit.jupiter.api.io.TempDir
 import org.springframework.boot.WebApplicationType
 import org.springframework.boot.builder.SpringApplicationBuilder
+import org.springframework.boot.test.context.TestConfiguration
 import org.springframework.boot.test.system.CapturedOutput
 import org.springframework.boot.test.system.OutputCaptureExtension
 import org.springframework.boot.web.context.WebServerApplicationContext
 import org.springframework.context.ConfigurableApplicationContext
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Primary
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
+import java.math.BigDecimal
 import java.net.URI
 import java.net.URLDecoder
 import java.net.http.HttpClient
@@ -86,6 +109,7 @@ class OperatorSecurityIntegrationTest {
             assertThat(snapshot["health"]["publicDataReadiness"].asText())
                 .isEqualTo("NOT_READY")
             assertThat(snapshot["publicMarketData"]).isEmpty()
+            assertThat(snapshot["levels"]).isEmpty()
             assertThat(snapshot["health"]["privateStreamReadiness"].asText())
                 .isEqualTo("NOT_READY")
             assertThat(snapshot["health"]["clockReadiness"].asText())
@@ -141,17 +165,60 @@ class OperatorSecurityIntegrationTest {
             )
 
             val missingTokenResponse = application.post(
-                path = "/api/future-control",
+                path = "/api/levels",
+                body = VALID_LEVEL_REQUEST,
             )
             assertThat(missingTokenResponse.statusCode()).isEqualTo(403)
 
             val validTokenResponse = application.post(
-                path = "/api/future-control",
+                path = "/api/levels",
+                cookie = cookiePair,
+                csrfToken = csrfToken,
+                body = VALID_LEVEL_REQUEST,
+            )
+            assertThat(validTokenResponse.statusCode()).isEqualTo(201)
+            val createdLevel =
+                application.objectMapper.readTree(validTokenResponse.body())
+            assertThat(createdLevel["state"].asText()).isEqualTo("WARMING_UP")
+            assertThat(validTokenResponse.body()).doesNotContainCredentials()
+
+            val populatedSnapshot = application.getSnapshot(
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(populatedSnapshot.statusCode()).isEqualTo(200)
+            val populated = application.objectMapper.readTree(
+                populatedSnapshot.body(),
+            )
+            assertThat(populated["levelCount"].asInt()).isOne()
+            assertThat(populated["levels"]).hasSize(1)
+
+            val deleteResponse = application.delete(
+                path = "/api/levels/${createdLevel["id"].asText()}",
                 cookie = cookiePair,
                 csrfToken = csrfToken,
             )
-            assertThat(validTokenResponse.statusCode()).isEqualTo(404)
-            assertThat(validTokenResponse.body()).doesNotContainCredentials()
+            assertThat(deleteResponse.statusCode()).isEqualTo(200)
+
+            val emptySnapshot = application.getSnapshot(
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(
+                application.objectMapper.readTree(emptySnapshot.body())["levels"],
+            ).isEmpty()
+
+            val nonFiniteResponse = application.post(
+                path = "/api/levels",
+                cookie = cookiePair,
+                csrfToken = csrfToken,
+                body = NON_FINITE_LEVEL_REQUEST,
+            )
+            assertThat(nonFiniteResponse.statusCode()).isEqualTo(400)
+            assertThat(
+                application.objectMapper.readTree(nonFiniteResponse.body())["code"]
+                    .asText(),
+            ).isEqualTo("INVALID_LEVEL")
         }
     }
 
@@ -159,7 +226,10 @@ class OperatorSecurityIntegrationTest {
         block: (HttpsApplication) -> Unit,
     ) {
         val keyStorePath = createTestKeyStore()
-        val context = SpringApplicationBuilder(BreakoutBotApplication::class.java)
+        val context = SpringApplicationBuilder(
+            BreakoutBotApplication::class.java,
+            SecurityLevelTestConfiguration::class.java,
+        )
             .web(WebApplicationType.REACTIVE)
             .properties(
                 "spring.main.banner-mode=off",
@@ -293,6 +363,7 @@ class OperatorSecurityIntegrationTest {
         path: String,
         cookie: String? = null,
         csrfToken: String? = null,
+        body: String = "",
     ): HttpResponse<String> {
         val request = HttpRequest
             .newBuilder(baseUri.resolve(path))
@@ -300,7 +371,9 @@ class OperatorSecurityIntegrationTest {
                 "Authorization",
                 basicAuthorization(OPERATOR_USERNAME, OPERATOR_PASSWORD),
             )
-            .POST(HttpRequest.BodyPublishers.noBody())
+            .header("Origin", "${baseUri.scheme}://${baseUri.authority}")
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
         if (cookie != null) {
             request.header("Cookie", cookie)
         }
@@ -312,6 +385,25 @@ class OperatorSecurityIntegrationTest {
             request.build(),
             HttpResponse.BodyHandlers.ofString(),
         )
+    }
+
+    private fun HttpsApplication.delete(
+        path: String,
+        cookie: String,
+        csrfToken: String,
+    ): HttpResponse<String> {
+        val request = HttpRequest
+            .newBuilder(baseUri.resolve(path))
+            .header(
+                "Authorization",
+                basicAuthorization(OPERATOR_USERNAME, OPERATOR_PASSWORD),
+            )
+            .header("Origin", "${baseUri.scheme}://${baseUri.authority}")
+            .header("Cookie", cookie)
+            .header(CSRF_HEADER_NAME, csrfToken)
+            .DELETE()
+            .build()
+        return client.send(request, HttpResponse.BodyHandlers.ofString())
     }
 
     private fun basicAuthorization(
@@ -345,5 +437,145 @@ class OperatorSecurityIntegrationTest {
         private const val KEY_ALIAS = "operator"
         private const val CSRF_COOKIE_NAME = "XSRF-TOKEN"
         private const val CSRF_HEADER_NAME = "X-XSRF-TOKEN"
+        private val VALID_LEVEL_REQUEST =
+            """
+            {
+              "symbol":"btcusdt",
+              "direction":"LONG",
+              "levelPrice":101.2,
+              "positionNotionalUsdt":1000,
+              "maxImpulsePct":2.5
+            }
+            """.trimIndent()
+        private val NON_FINITE_LEVEL_REQUEST =
+            VALID_LEVEL_REQUEST.replace("101.2", "\"NaN\"")
     }
+}
+
+@TestConfiguration(proxyBeanMethods = false)
+class SecurityLevelTestConfiguration {
+    @Bean
+    @Primary
+    fun securityTestBinanceClient(): AuthenticatedBinanceClient =
+        SecurityTestBinanceClient()
+
+    @Bean
+    @Primary
+    fun securityTestPublicMarketDataStreamProvider():
+        PublicMarketDataStreamProvider = SecurityTestMarketDataStreamProvider
+}
+
+private object SecurityTestMarketDataStreamProvider :
+    PublicMarketDataStreamProvider {
+    override fun aggregateTrades(symbol: String): Flux<AggregateTradeEvent> =
+        Flux.never()
+
+    override fun bookTickers(symbol: String): Flux<BookTickerEvent> = Flux.never()
+}
+
+private class SecurityTestBinanceClient : AuthenticatedBinanceClient {
+    private var marginType = BinanceMarginType.CROSSED
+    private var leverage = 5
+
+    override fun synchronizeClock(): Mono<BinanceClockMeasurement> = unsupported()
+
+    override fun accountSummary(): Mono<BinanceAccountSummary> = unsupported()
+
+    override fun positionMode(): Mono<BinancePositionMode> = unsupported()
+
+    override fun assetMode(): Mono<BinanceAssetMode> = unsupported()
+
+    override fun exchangeInfo(): Mono<BinanceExchangeInfo> =
+        Mono.just(
+            BinanceExchangeInfo(
+                serverTime = Instant.parse("2026-07-31T12:00:00Z"),
+                symbols = listOf(
+                    BinanceSymbolMetadata(
+                        symbol = "BTCUSDT",
+                        status = "TRADING",
+                        contractType = "PERPETUAL",
+                        baseAsset = "BTC",
+                        quoteAsset = "USDT",
+                        marginAsset = "USDT",
+                        pricePrecision = 1,
+                        quantityPrecision = 3,
+                        priceFilter = BinancePriceFilter(
+                            minimumPrice = BigDecimal("0.1"),
+                            maximumPrice = BigDecimal("1000000"),
+                            tickSize = BigDecimal("0.1"),
+                        ),
+                        lotSizeFilter = BinanceLotSizeFilter(
+                            minimumQuantity = BigDecimal("0.001"),
+                            maximumQuantity = BigDecimal("1000"),
+                            stepSize = BigDecimal("0.001"),
+                        ),
+                        marketLotSizeFilter = null,
+                        minimumNotional = BigDecimal("5"),
+                    ),
+                ),
+            ),
+        )
+
+    override fun leverageBrackets(
+        symbol: String,
+    ): Mono<BinanceSymbolLeverageBrackets> =
+        Mono.just(
+            BinanceSymbolLeverageBrackets(
+                symbol = symbol,
+                notionalCoefficient = BigDecimal.ONE,
+                brackets = listOf(
+                    BinanceLeverageBracket(
+                        bracket = 1,
+                        initialLeverage = 50,
+                        notionalFloor = BigDecimal.ZERO,
+                        notionalCap = BigDecimal("50000"),
+                        maintenanceMarginRatio = BigDecimal("0.004"),
+                        cumulativeMaintenanceAmount = BigDecimal.ZERO,
+                    ),
+                ),
+            ),
+        )
+
+    override fun commissionRate(symbol: String): Mono<BinanceCommissionRate> =
+        unsupported()
+
+    override fun markPrice(symbol: String): Mono<BigDecimal> =
+        Mono.just(BigDecimal("100"))
+
+    override fun symbolConfiguration(
+        symbol: String,
+    ): Mono<BinanceSymbolConfiguration> =
+        Mono.just(
+            BinanceSymbolConfiguration(
+                symbol = symbol,
+                marginType = marginType,
+                autoAddMargin = false,
+                leverage = leverage,
+                maximumNotional = BigDecimal("50000"),
+            ),
+        )
+
+    override fun changeMarginType(
+        symbol: String,
+        marginType: BinanceMarginType,
+    ): Mono<Void> {
+        this.marginType = marginType
+        return Mono.empty()
+    }
+
+    override fun changeInitialLeverage(
+        symbol: String,
+        leverage: Int,
+    ): Mono<Void> {
+        this.leverage = leverage
+        return Mono.empty()
+    }
+
+    override fun startUserDataStream(): Mono<String> = unsupported()
+
+    override fun keepAliveUserDataStream(listenKey: String): Mono<Void> =
+        unsupported()
+
+    private fun <T> unsupported(): Mono<T> =
+        Mono.error(UnsupportedOperationException("Not used by security tests"))
 }

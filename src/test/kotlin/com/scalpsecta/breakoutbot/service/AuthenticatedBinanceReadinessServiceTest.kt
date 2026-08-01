@@ -7,10 +7,12 @@ import com.scalpsecta.breakoutbot.binance.BinanceClockMeasurement
 import com.scalpsecta.breakoutbot.binance.BinanceCommissionRate
 import com.scalpsecta.breakoutbot.binance.BinanceExchangeInfo
 import com.scalpsecta.breakoutbot.binance.BinanceLeverageBracket
+import com.scalpsecta.breakoutbot.binance.BinanceMarginType
 import com.scalpsecta.breakoutbot.binance.BinancePositionMode
 import com.scalpsecta.breakoutbot.binance.BinancePrivateStreamConnectionState
 import com.scalpsecta.breakoutbot.binance.BinancePrivateStreamMessage
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
+import com.scalpsecta.breakoutbot.binance.BinanceSymbolConfiguration
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.binance.BinanceUserDataStreamProvider
 import com.scalpsecta.breakoutbot.domain.BinanceReadiness
@@ -204,6 +206,32 @@ private class RecordingReadinessClient(
                 takerRate = BigDecimal("0.0005"),
             )
         }
+
+    override fun markPrice(symbol: String): Mono<BigDecimal> =
+        Mono.just(BigDecimal("100"))
+
+    override fun symbolConfiguration(
+        symbol: String,
+    ): Mono<BinanceSymbolConfiguration> =
+        Mono.just(
+            BinanceSymbolConfiguration(
+                symbol = symbol,
+                marginType = BinanceMarginType.ISOLATED,
+                autoAddMargin = false,
+                leverage = 20,
+                maximumNotional = BigDecimal("50000"),
+            ),
+        )
+
+    override fun changeMarginType(
+        symbol: String,
+        marginType: BinanceMarginType,
+    ): Mono<Void> = Mono.empty()
+
+    override fun changeInitialLeverage(
+        symbol: String,
+        leverage: Int,
+    ): Mono<Void> = Mono.empty()
 
     override fun startUserDataStream(): Mono<String> =
         record(ReadinessOperation.START_USER_DATA_STREAM) {

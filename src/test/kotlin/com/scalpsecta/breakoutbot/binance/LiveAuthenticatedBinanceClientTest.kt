@@ -144,6 +144,50 @@ class LiveAuthenticatedBinanceClientTest {
     }
 
     @Test
+    fun `client loads mark price and sets then verifies symbol configuration`() {
+        val exchange = RecordingExchange(::responseFor)
+        val client = client(exchange)
+
+        val markPrice = client.markPrice("btcusdt").block()!!
+        val configuration = client.symbolConfiguration("btcusdt").block()!!
+        client.changeMarginType("btcusdt", BinanceMarginType.ISOLATED).block()
+        client.changeInitialLeverage("btcusdt", 20).block()
+
+        assertThat(markPrice).isEqualByComparingTo(BigDecimal("65432.10"))
+        assertThat(configuration.symbol).isEqualTo("BTCUSDT")
+        assertThat(configuration.marginType).isEqualTo(BinanceMarginType.ISOLATED)
+        assertThat(configuration.autoAddMargin).isFalse()
+        assertThat(configuration.leverage).isEqualTo(20)
+        assertThat(configuration.maximumNotional)
+            .isEqualByComparingTo(BigDecimal("50000"))
+
+        val markRequest = exchange.requests.single { request ->
+            request.url().path == "/fapi/v1/premiumIndex"
+        }
+        assertThat(markRequest.method()).isEqualTo(HttpMethod.GET)
+        assertThat(markRequest.url().query).isEqualTo("symbol=BTCUSDT")
+
+        val signedMutations = exchange.requests.filter { request ->
+            request.url().path in setOf(
+                "/fapi/v1/marginType",
+                "/fapi/v1/leverage",
+            )
+        }
+        assertThat(signedMutations).hasSize(2)
+        assertThat(signedMutations).allSatisfy { request ->
+            assertThat(request.method()).isEqualTo(HttpMethod.POST)
+            assertThat(request.headers().getFirst("X-MBX-APIKEY"))
+                .isEqualTo("test-api-key")
+            assertThat(request.url().query).contains(
+                "symbol=BTCUSDT",
+                "recvWindow=5000",
+                "timestamp=1785496333456",
+                "signature=",
+            )
+        }
+    }
+
+    @Test
     fun `Binance errors do not expose credentials signatures or response bodies`() {
         val exchange = RecordingExchange {
             response(
@@ -250,6 +294,40 @@ class LiveAuthenticatedBinanceClientTest {
                       "symbol":"BTCUSDT",
                       "makerCommissionRate":"0.000200",
                       "takerCommissionRate":"0.000500"
+                    }
+                    """.trimIndent(),
+            )
+            "/fapi/v1/premiumIndex" -> response(
+                body =
+                    """
+                    {
+                      "symbol":"BTCUSDT",
+                      "markPrice":"65432.10"
+                    }
+                    """.trimIndent(),
+            )
+            "/fapi/v1/symbolConfig" -> response(
+                body =
+                    """
+                    [{
+                      "symbol":"BTCUSDT",
+                      "marginType":"ISOLATED",
+                      "isAutoAddMargin":false,
+                      "leverage":20,
+                      "maxNotionalValue":"50000"
+                    }]
+                    """.trimIndent(),
+            )
+            "/fapi/v1/marginType" -> response(
+                body = """{"code":200,"msg":"success"}""",
+            )
+            "/fapi/v1/leverage" -> response(
+                body =
+                    """
+                    {
+                      "symbol":"BTCUSDT",
+                      "leverage":20,
+                      "maxNotionalValue":"50000"
                     }
                     """.trimIndent(),
             )

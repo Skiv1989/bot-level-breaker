@@ -4,6 +4,7 @@ import com.scalpsecta.breakoutbot.domain.BinanceReadiness
 import com.scalpsecta.breakoutbot.domain.RuntimeHealth
 import com.scalpsecta.breakoutbot.domain.RuntimeSnapshot
 import com.scalpsecta.breakoutbot.domain.TradingReadiness
+import com.scalpsecta.breakoutbot.level.LevelService
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
 import org.springframework.stereotype.Service
 import java.time.Instant
@@ -13,6 +14,7 @@ class BotStateService(
     private val publicMarketDataService: PublicMarketDataService,
     private val authenticatedBinanceReadinessService:
         AuthenticatedBinanceReadinessService,
+    private val levelService: LevelService,
 ) {
     private val startedAt = Instant.now()
 
@@ -26,9 +28,11 @@ class BotStateService(
             authenticatedBinance.privateStream.readiness
         val clockReadiness = authenticatedBinance.clock.readiness
         val accountReadiness = authenticatedBinance.account.readiness
+        val levels = levelService.currentState()
         return RuntimeSnapshot(
             startedAt = startedAt,
-            levelCount = 0,
+            levelCount = levels.size,
+            levels = levels,
             recoveredAttemptCount = 0,
             publicMarketData = publicMarketData,
             authenticatedBinance = authenticatedBinance,

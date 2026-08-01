@@ -84,6 +84,19 @@ data class BinanceCommissionRate(
     val takerRate: BigDecimal,
 )
 
+data class BinanceSymbolConfiguration(
+    val symbol: String,
+    val marginType: BinanceMarginType,
+    val autoAddMargin: Boolean,
+    val leverage: Int,
+    val maximumNotional: BigDecimal,
+)
+
+enum class BinanceMarginType {
+    ISOLATED,
+    CROSSED,
+}
+
 sealed interface BinanceUserDataEvent {
     val eventTime: Instant
     val transactionTime: Instant?
