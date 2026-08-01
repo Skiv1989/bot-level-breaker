@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.context.annotation.Primary
 import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient
 import org.springframework.web.reactive.socket.client.WebSocketClient
@@ -30,6 +31,15 @@ class AuthenticatedBinanceConfiguration {
             credentialsProvider = credentialsProvider,
             clock = clock,
         )
+
+    @Bean
+    @Primary
+    @ConditionalOnMissingBean(BinanceExecutionClient::class)
+    fun binanceExecutionClient(
+        authenticatedBinanceClient: AuthenticatedBinanceClient,
+    ): BinanceExecutionClient =
+        authenticatedBinanceClient as? BinanceExecutionClient
+            ?: UnavailableBinanceExecutionClient()
 
     @Bean
     @ConditionalOnMissingBean(BinanceUserDataEventParser::class)

@@ -1,6 +1,7 @@
 package com.scalpsecta.breakoutbot.risk
 
 import com.scalpsecta.breakoutbot.level.LevelDirection
+import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import java.math.BigDecimal
 import java.time.Instant
 import java.util.UUID
@@ -44,6 +45,7 @@ data class AttemptAdmissionDecision(
 )
 
 enum class RiskBlockerCode {
+    BLOCKED_SAFE_MODE,
     STOP_RISK_TOO_HIGH,
     PLANNED_NET_R_TOO_LOW,
     BLOCKED_MARGIN_BUFFER,
@@ -79,6 +81,8 @@ data class PlannedTakeProfit(
 
 data class GlobalRiskSnapshot(
     val observedAt: Instant,
+    val globalTradingState: GlobalTradingState,
+    val stateReason: String?,
     val dailyAnchorEquity: BigDecimal?,
     val currentTotalAccountEquity: BigDecimal?,
     val dailyLossLimit: BigDecimal?,
@@ -124,4 +128,3 @@ enum class RiskReservationStatus {
     PENDING_ATTEMPT,
     OPEN_POSITION,
 }
-

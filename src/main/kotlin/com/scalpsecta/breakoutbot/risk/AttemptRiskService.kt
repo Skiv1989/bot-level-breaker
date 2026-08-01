@@ -9,6 +9,7 @@ import com.scalpsecta.breakoutbot.evidence.PriceEvidence
 import com.scalpsecta.breakoutbot.evidence.QuantityEvidence
 import com.scalpsecta.breakoutbot.evidence.RiskEvidence
 import com.scalpsecta.breakoutbot.level.LevelDirection
+import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import com.scalpsecta.breakoutbot.level.LevelState
 import jakarta.annotation.PreDestroy
 import org.springframework.beans.factory.annotation.Autowired
@@ -44,6 +45,8 @@ class AttemptRiskService internal constructor(
     private val attempts = linkedMapOf<UUID, MutableRiskAttempt>()
     private val reservations = linkedMapOf<UUID, MutableRiskReservation>()
     private var latestAccountState: RiskAccountState? = null
+    private var globalTradingState = GlobalTradingState.RUNNING
+    private var stateReason: String? = null
     private var nextSequence = 1L
     private val publishedState = AtomicReference(emptySnapshot(clock.instant()))
     private val queue = OrderedGlobalRiskQueue<RiskEvent>(scheduler, ::handle)
@@ -87,6 +90,13 @@ class AttemptRiskService internal constructor(
             .submit(RiskEvent.ConfirmedFlat(levelId, clock.instant()))
             .map { result -> result as GlobalRiskSnapshot }
 
+    fun enterSafeMode(reason: String): Mono<GlobalRiskSnapshot> {
+        require(reason.isNotBlank()) { "reason must not be blank" }
+        return queue
+            .submit(RiskEvent.EnterSafeMode(reason))
+            .map { result -> result as GlobalRiskSnapshot }
+    }
+
     fun currentState(): GlobalRiskSnapshot = publishedState.get()
 
     @PreDestroy
@@ -101,7 +111,16 @@ class AttemptRiskService internal constructor(
             is RiskEvent.ConfirmedExposure -> confirmExposure(event)
             is RiskEvent.ConfirmedReducingFill -> confirmReducingFill(event)
             is RiskEvent.ConfirmedFlat -> confirmFlat(event)
+            is RiskEvent.EnterSafeMode -> enterSafeMode(event)
         }
+
+    private fun enterSafeMode(
+        event: RiskEvent.EnterSafeMode,
+    ): GlobalRiskSnapshot {
+        globalTradingState = GlobalTradingState.SAFE_MODE
+        stateReason = event.reason
+        return publishState()
+    }
 
     private fun admit(event: RiskEvent.Admit): AttemptAdmissionDecision {
         validate(event.request, event.accountState)
@@ -312,6 +331,9 @@ class AttemptRiskService internal constructor(
         plan: AttemptRiskPlan,
     ): List<RiskBlockerCode> =
         buildList {
+            if (globalTradingState != GlobalTradingState.RUNNING) {
+                add(RiskBlockerCode.BLOCKED_SAFE_MODE)
+            }
             if (plan.estimatedWorstNetLoss > plan.levelRiskBudget) {
                 add(RiskBlockerCode.STOP_RISK_TOO_HIGH)
             }
@@ -657,6 +679,8 @@ class AttemptRiskService internal constructor(
         }
         return GlobalRiskSnapshot(
             observedAt = now,
+            globalTradingState = globalTradingState,
+            stateReason = stateReason,
             dailyAnchorEquity = accountState?.dailyAnchorEquity,
             currentTotalAccountEquity =
                 accountState?.currentTotalAccountEquity,
@@ -735,6 +759,10 @@ private sealed interface RiskEvent {
         val levelId: UUID,
         val confirmedAt: Instant,
     ) : RiskEvent
+
+    data class EnterSafeMode(
+        val reason: String,
+    ) : RiskEvent
 }
 
 private data class MutableRiskAttempt(
@@ -791,6 +819,8 @@ private fun String.normalizedSymbol(): String = trim().uppercase()
 private fun emptySnapshot(now: Instant): GlobalRiskSnapshot =
     GlobalRiskSnapshot(
         observedAt = now,
+        globalTradingState = GlobalTradingState.RUNNING,
+        stateReason = null,
         dailyAnchorEquity = null,
         currentTotalAccountEquity = null,
         dailyLossLimit = null,

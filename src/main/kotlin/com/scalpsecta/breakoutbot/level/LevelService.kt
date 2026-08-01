@@ -207,15 +207,17 @@ class LevelService internal constructor(
             ),
         )
 
-    internal fun processOrderEventPlaceholder(
+    internal fun processExecutionEvent(
         symbol: String,
         eventId: String,
-    ): Mono<Void> =
-        submitSymbolEvent(
+        action: () -> Any,
+    ): Mono<Any> =
+        submitSymbolEventResult(
             symbol = symbol,
-            event = SymbolLevelEvent.OrderEventPlaceholder(
+            event = SymbolLevelEvent.Execution(
                 eventId = eventId,
                 processedAt = clock.instant(),
+                action = action,
             ),
         )
 
@@ -235,7 +237,12 @@ class LevelService internal constructor(
     private fun submitSymbolEvent(
         symbol: String,
         event: SymbolLevelEvent,
-    ): Mono<Void> {
+    ): Mono<Void> = submitSymbolEventResult(symbol, event).then()
+
+    private fun submitSymbolEventResult(
+        symbol: String,
+        event: SymbolLevelEvent,
+    ): Mono<Any> {
         val normalizedSymbol = symbol.trim().uppercase()
         val runtime = lock.withLock {
             symbolRuntimes[normalizedSymbol]?.also { it.pendingEvents += 1 }
@@ -245,7 +252,7 @@ class LevelService internal constructor(
                 "No levels exist for $normalizedSymbol",
             ),
         )
-        return submit(runtime, event).then()
+        return submit(runtime, event)
     }
 
     private fun handleSymbolEvent(
@@ -353,7 +360,7 @@ class LevelService internal constructor(
                     Unit
                 }
 
-                is SymbolLevelEvent.OrderEventPlaceholder -> Unit
+                is SymbolLevelEvent.Execution -> event.action()
             }
         }
 
@@ -1438,9 +1445,10 @@ private sealed interface SymbolLevelEvent {
         val marketHealthy: Boolean,
     ) : SymbolLevelEvent
 
-    data class OrderEventPlaceholder(
+    data class Execution(
         val eventId: String,
         val processedAt: Instant,
+        val action: () -> Any,
     ) : SymbolLevelEvent
 }
 

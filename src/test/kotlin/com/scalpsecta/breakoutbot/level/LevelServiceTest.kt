@@ -422,7 +422,11 @@ class LevelServiceTest {
             ownsExposure = false,
             hasUnresolvedOrder = false,
         ).block()
-        service.processOrderEventPlaceholder("BTCUSDT", "order-1").block()
+        val executionResult = service.processExecutionEvent(
+            symbol = "BTCUSDT",
+            eventId = "order-1",
+        ) { "processed-on-symbol-queue" }.block()
+        assertThat(executionResult).isEqualTo("processed-on-symbol-queue")
 
         val conflict = levelFailure {
             service.recordOwnership(

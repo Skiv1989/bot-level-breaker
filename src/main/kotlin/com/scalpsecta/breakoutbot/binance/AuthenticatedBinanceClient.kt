@@ -11,6 +11,7 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.time.Clock
 import java.time.Instant
+import java.util.Optional
 import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -112,7 +113,7 @@ class LiveAuthenticatedBinanceClient(
     private val objectMapper: ObjectMapper,
     private val credentialsProvider: BinanceCredentialsProvider,
     private val clock: Clock,
-) : AuthenticatedBinanceClient {
+) : AuthenticatedBinanceClient, BinanceExecutionClient {
     private val serverOffsetMillis = AtomicLong()
 
     override fun synchronizeClock(): Mono<BinanceClockMeasurement> =
@@ -297,6 +298,89 @@ class LiveAuthenticatedBinanceClient(
         ).then()
     }
 
+    override fun placeOrder(
+        request: BinanceOrderRequest,
+    ): Mono<BinanceOrderAcknowledgement> {
+        validateOrderRequest(request)
+        val parameters = linkedMapOf(
+            "symbol" to normalizedSymbol(request.symbol),
+            "side" to request.side,
+            "type" to request.type,
+        )
+        request.timeInForce?.let { parameters["timeInForce"] = it }
+        request.quantity?.let {
+            parameters["quantity"] = it.toPlainString()
+        }
+        request.price?.let { parameters["price"] = it.toPlainString() }
+        request.stopPrice?.let {
+            parameters["stopPrice"] = it.toPlainString()
+        }
+        parameters["newClientOrderId"] = request.clientOrderId
+        if (request.reduceOnly) {
+            parameters["reduceOnly"] = true.toString()
+        }
+        if (request.closePosition) {
+            parameters["closePosition"] = true.toString()
+        }
+        parameters["newOrderRespType"] = "ACK"
+        return signedRequest(
+            method = HttpMethod.POST,
+            path = ORDER_PATH,
+            parameters = parameters,
+        ).map { payload ->
+            BinanceOrderAcknowledgement(
+                symbol = payload.requiredText("symbol"),
+                clientOrderId = payload.requiredText("clientOrderId"),
+                orderId = payload.requiredLong("orderId"),
+                status = payload.requiredText("status"),
+            )
+        }
+    }
+
+    override fun reconcileOrder(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<BinanceOrderReconciliation> {
+        val normalizedSymbol = normalizedSymbol(symbol)
+        require(clientOrderId.matches(BINANCE_CLIENT_ORDER_ID)) {
+            "clientOrderId must be Binance-safe"
+        }
+        val order = signedGet(
+            path = ORDER_PATH,
+            parameters = linkedMapOf(
+                "symbol" to normalizedSymbol,
+                "origClientOrderId" to clientOrderId,
+            ),
+        )
+            .map(::parseOrderStatus)
+            .map(Optional<BinanceOrderStatus>::of)
+            .onErrorReturn(Optional.empty())
+        val position = signedGet(
+            path = POSITION_RISK_PATH,
+            parameters = linkedMapOf("symbol" to normalizedSymbol),
+        ).map { payload -> parsePositionRisk(payload, normalizedSymbol) }
+        val openOrders = signedGet(
+            path = OPEN_ORDERS_PATH,
+            parameters = linkedMapOf("symbol" to normalizedSymbol),
+        ).map { payload ->
+            if (payload.isArray) {
+                payload.map { orderPayload ->
+                    orderPayload.requiredText("clientOrderId")
+                }.toSet()
+            } else {
+                emptySet()
+            }
+        }
+        return Mono.zip(order, position, openOrders)
+            .map { result ->
+                BinanceOrderReconciliation(
+                    order = result.t1.orElse(null),
+                    position = result.t2,
+                    openClientOrderIds = result.t3,
+                )
+            }
+    }
+
     private fun signedGet(
         path: String,
         parameters: LinkedHashMap<String, String> = linkedMapOf(),
@@ -427,6 +511,66 @@ class LiveAuthenticatedBinanceClient(
             },
         )
 
+    private fun parseOrderStatus(payload: JsonNode): BinanceOrderStatus =
+        BinanceOrderStatus(
+            symbol = payload.requiredText("symbol"),
+            clientOrderId = payload.requiredText("clientOrderId"),
+            orderId = payload.requiredLong("orderId"),
+            status = payload.requiredText("status"),
+            originalQuantity = payload.requiredDecimal("origQty"),
+            executedQuantity = payload.requiredDecimal("executedQty"),
+            averagePrice = payload.requiredDecimal("avgPrice"),
+            reduceOnly = payload.requiredBoolean("reduceOnly"),
+            closePosition = payload.requiredBoolean("closePosition"),
+            updatedAt = Instant.ofEpochMilli(payload.requiredLong("updateTime")),
+        )
+
+    private fun parsePositionRisk(
+        payload: JsonNode,
+        symbol: String,
+    ): BinancePositionRisk {
+        val position = payload
+            .takeIf(JsonNode::isArray)
+            ?.firstOrNull { candidate ->
+                candidate.requiredText("symbol") == symbol &&
+                    candidate.requiredText("positionSide") == "BOTH"
+            }
+        return if (position == null) {
+            BinancePositionRisk(
+                symbol = symbol,
+                positionAmount = BigDecimal.ZERO,
+                entryPrice = BigDecimal.ZERO,
+            )
+        } else {
+            BinancePositionRisk(
+                symbol = symbol,
+                positionAmount = position.requiredDecimal("positionAmt"),
+                entryPrice = position.requiredDecimal("entryPrice"),
+            )
+        }
+    }
+
+    private fun validateOrderRequest(request: BinanceOrderRequest) {
+        require(request.clientOrderId.matches(BINANCE_CLIENT_ORDER_ID)) {
+            "clientOrderId must be Binance-safe"
+        }
+        require(request.quantity?.signum()?.let { it > 0 } != false) {
+            "quantity must be positive"
+        }
+        require(request.price?.signum()?.let { it > 0 } != false) {
+            "price must be positive"
+        }
+        require(request.stopPrice?.signum()?.let { it > 0 } != false) {
+            "stopPrice must be positive"
+        }
+        require(!request.closePosition || request.quantity == null) {
+            "close-position orders must not specify quantity"
+        }
+        require(!request.closePosition || !request.reduceOnly) {
+            "close-position orders must not also be reduce-only"
+        }
+    }
+
     private fun normalizedSymbol(symbol: String): String =
         symbol.trim().uppercase().also { normalized ->
             require(normalized.isNotEmpty()) {
@@ -495,6 +639,9 @@ private const val SYMBOL_CONFIGURATION_PATH = "/fapi/v1/symbolConfig"
 private const val MARGIN_TYPE_PATH = "/fapi/v1/marginType"
 private const val LEVERAGE_PATH = "/fapi/v1/leverage"
 private const val LISTEN_KEY_PATH = "/fapi/v1/listenKey"
+private const val ORDER_PATH = "/fapi/v1/order"
+private const val OPEN_ORDERS_PATH = "/fapi/v1/openOrders"
+private const val POSITION_RISK_PATH = "/fapi/v3/positionRisk"
 private const val BINANCE_API_KEY_HEADER = "X-MBX-APIKEY"
 private const val BINANCE_API_KEY_VARIABLE = "BINANCE_API_KEY"
 private const val BINANCE_API_SECRET_VARIABLE = "BINANCE_API_SECRET"
@@ -506,6 +653,7 @@ private const val MARKET_LOT_SIZE = "MARKET_LOT_SIZE"
 private const val MIN_NOTIONAL = "MIN_NOTIONAL"
 private const val NOTIONAL = "NOTIONAL"
 private const val MAX_BINANCE_LEVERAGE = 125
+private val BINANCE_CLIENT_ORDER_ID = Regex("^[.A-Za-z0-9_:/-]{1,36}$")
 
 internal fun liveBinanceWebClient(builder: WebClient.Builder): WebClient =
     builder

@@ -188,6 +188,109 @@ class LiveAuthenticatedBinanceClientTest {
     }
 
     @Test
+    fun `execution client places ACK-only orders and reconciles by client order ID`() {
+        val exchange = RecordingExchange { request ->
+            when (request.url().path) {
+                "/fapi/v1/order" -> if (request.method() == HttpMethod.POST) {
+                    response(
+                        body =
+                            """
+                            {
+                              "symbol":"BTCUSDT",
+                              "clientOrderId":"safe-client-order-id",
+                              "orderId":42,
+                              "status":"NEW"
+                            }
+                            """.trimIndent(),
+                    )
+                } else {
+                    response(
+                        body =
+                            """
+                            {
+                              "symbol":"BTCUSDT",
+                              "clientOrderId":"safe-client-order-id",
+                              "orderId":42,
+                              "status":"PARTIALLY_FILLED",
+                              "origQty":"0.300",
+                              "executedQty":"0.180",
+                              "avgPrice":"65432.10",
+                              "reduceOnly":false,
+                              "closePosition":false,
+                              "updateTime":1785496333456
+                            }
+                            """.trimIndent(),
+                    )
+                }
+
+                "/fapi/v3/positionRisk" -> response(
+                    body =
+                        """
+                        [{
+                          "symbol":"BTCUSDT",
+                          "positionSide":"BOTH",
+                          "positionAmt":"0.180",
+                          "entryPrice":"65432.10"
+                        }]
+                        """.trimIndent(),
+                )
+
+                "/fapi/v1/openOrders" -> response(body = "[]")
+                else -> error(
+                    "Unexpected request: ${request.method()} ${request.url()}",
+                )
+            }
+        }
+        val client = client(exchange) as BinanceExecutionClient
+
+        val acknowledgement = client.placeOrder(
+            BinanceOrderRequest(
+                symbol = "btcusdt",
+                clientOrderId = "safe-client-order-id",
+                side = "BUY",
+                type = "LIMIT",
+                timeInForce = "IOC",
+                quantity = BigDecimal("0.300"),
+                price = BigDecimal("65433.00"),
+            ),
+        ).block()!!
+        val reconciliation = client.reconcileOrder(
+            symbol = "btcusdt",
+            clientOrderId = "safe-client-order-id",
+        ).block()!!
+
+        assertThat(acknowledgement.orderId).isEqualTo(42)
+        assertThat(reconciliation.order?.executedQuantity)
+            .isEqualByComparingTo("0.180")
+        assertThat(reconciliation.position?.positionAmount)
+            .isEqualByComparingTo("0.180")
+        assertThat(reconciliation.openClientOrderIds).isEmpty()
+
+        val placement = exchange.requests.single { request ->
+            request.url().path == "/fapi/v1/order" &&
+                request.method() == HttpMethod.POST
+        }
+        val placementQuery = UriComponentsBuilder
+            .fromUri(placement.url())
+            .build()
+            .queryParams
+        assertThat(placementQuery.getFirst("newClientOrderId"))
+            .isEqualTo("safe-client-order-id")
+        assertThat(placementQuery.getFirst("newOrderRespType"))
+            .isEqualTo("ACK")
+        assertThat(placementQuery.getFirst("quantity")).isEqualTo("0.300")
+        assertThat(placementQuery.getFirst("price")).isEqualTo("65433.00")
+        assertThat(placementQuery.getFirst("signature")).isNotBlank()
+
+        val orderQuery = exchange.requests.single { request ->
+            request.url().path == "/fapi/v1/order" &&
+                request.method() == HttpMethod.GET
+        }
+        assertThat(orderQuery.url().query)
+            .contains("origClientOrderId=safe-client-order-id")
+    }
+
+    @Test
     fun `Binance errors do not expose credentials signatures or response bodies`() {
         val exchange = RecordingExchange {
             response(

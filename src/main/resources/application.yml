@@ -22,6 +22,9 @@ bot:
     recent-trade-limit: 200
     raw-event-limit: 100000
     shutdown-flush-timeout: 2s
+  execution:
+    request-timeout: 1s
+    reconciliation-interval: 1s
   security:
     username: "${BOT_BASIC_USERNAME}"
     password: "${BOT_BASIC_PASSWORD}"

@@ -1,6 +1,7 @@
 package com.scalpsecta.breakoutbot.risk
 
 import com.scalpsecta.breakoutbot.level.LevelDirection
+import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterEach
@@ -71,6 +72,19 @@ class AttemptRiskServiceTest {
             .isEqualByComparingTo(BigDecimal("40"))
         assertThat(decision.state.attempts.single().status)
             .isEqualTo(RiskAttemptStatus.PENDING_ENTRY)
+    }
+
+    @Test
+    fun `safe mode is serialized with global admission and blocks new attempts`() {
+        val safe = service.enterSafeMode("ORDER_OUTCOME_UNKNOWN").block()!!
+        val decision = service.admit(request(), account()).block()!!
+
+        assertThat(safe.globalTradingState)
+            .isEqualTo(GlobalTradingState.SAFE_MODE)
+        assertThat(safe.stateReason).isEqualTo("ORDER_OUTCOME_UNKNOWN")
+        assertThat(decision.admitted).isFalse()
+        assertThat(decision.blockers).contains(RiskBlockerCode.BLOCKED_SAFE_MODE)
+        assertThat(decision.state.reservations).isEmpty()
     }
 
     @Test
