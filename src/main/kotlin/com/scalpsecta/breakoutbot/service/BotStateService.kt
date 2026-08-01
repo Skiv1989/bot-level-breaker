@@ -7,6 +7,7 @@ import com.scalpsecta.breakoutbot.domain.TradingReadiness
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import com.scalpsecta.breakoutbot.level.LevelService
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
+import com.scalpsecta.breakoutbot.risk.AttemptRiskService
 import org.springframework.stereotype.Service
 import java.time.Instant
 
@@ -16,6 +17,7 @@ class BotStateService(
     private val authenticatedBinanceReadinessService:
         AuthenticatedBinanceReadinessService,
     private val levelService: LevelService,
+    private val attemptRiskService: AttemptRiskService,
 ) {
     private val startedAt = Instant.now()
 
@@ -43,6 +45,7 @@ class BotStateService(
             globalTradingState = globalTradingState,
             publicMarketData = publicMarketData,
             authenticatedBinance = authenticatedBinance,
+            risk = attemptRiskService.currentState(),
             health = RuntimeHealth(
                 publicDataReadiness = publicDataReadiness,
                 privateStreamReadiness = privateStreamReadiness,

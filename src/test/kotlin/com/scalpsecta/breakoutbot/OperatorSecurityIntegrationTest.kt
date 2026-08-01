@@ -132,6 +132,11 @@ class OperatorSecurityIntegrationTest {
             assertThat(
                 snapshot["authenticatedBinance"]["temporaryDailyAnchorEquity"].isNull,
             ).isTrue()
+            assertThat(snapshot["risk"]["dailyAnchorEquity"].isNull).isTrue()
+            assertThat(snapshot["risk"]["totalReservedRisk"].decimalValue())
+                .isEqualByComparingTo(BigDecimal.ZERO)
+            assertThat(snapshot["risk"]["attempts"]).isEmpty()
+            assertThat(snapshot["risk"]["reservations"]).isEmpty()
             assertThat(response.body()).doesNotContainCredentials()
         }
     }

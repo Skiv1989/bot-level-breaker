@@ -4,6 +4,7 @@ import com.scalpsecta.breakoutbot.binance.AuthenticatedBinanceSnapshot
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import com.scalpsecta.breakoutbot.level.LevelSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
+import com.scalpsecta.breakoutbot.risk.GlobalRiskSnapshot
 import java.time.Instant
 
 data class RuntimeSnapshot(
@@ -14,6 +15,7 @@ data class RuntimeSnapshot(
     val globalTradingState: GlobalTradingState,
     val publicMarketData: List<PublicMarketDataSnapshot>,
     val authenticatedBinance: AuthenticatedBinanceSnapshot,
+    val risk: GlobalRiskSnapshot,
     val health: RuntimeHealth,
 )
 
