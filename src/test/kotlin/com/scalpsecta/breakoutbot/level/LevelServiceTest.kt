@@ -16,12 +16,16 @@ import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
 import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
+import com.scalpsecta.breakoutbot.domain.BinanceReadiness
+import com.scalpsecta.breakoutbot.marketdata.AggregateTradeGapStatus
 import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
 import com.scalpsecta.breakoutbot.marketdata.AggressorSide
 import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
+import com.scalpsecta.breakoutbot.marketdata.MarketEventAgeSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataStreamProvider
+import com.scalpsecta.breakoutbot.marketdata.PublicStreamConnectionState
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowableOfType
 import org.junit.jupiter.api.AfterEach
@@ -479,6 +483,152 @@ class LevelServiceTest {
         }
     }
 
+    @Test
+    fun `pre-entry rechecks gates distance and lock then consumes exactly at dispatch`() {
+        val globalState = AtomicReference(GlobalTradingState.RUNNING)
+        val currentMarket = AtomicReference(healthyMarketSnapshot("89.99", "90.01"))
+        val readyService = LevelService(
+            client = client,
+            publicMarketDataService = marketDataService,
+            clock = clock,
+            automaticTimers = false,
+            evidenceRecorder = evidenceRecorder,
+            privateStreamReadinessProvider = { BinanceReadiness.READY },
+            globalTradingStateProvider = globalState::get,
+            publicMarketDataProvider = { currentMarket.get() },
+        )
+        try {
+            val created = readyService.create(command()).block()!!
+            readyService.process(
+                event = bookTicker("90"),
+                marketHealthy = true,
+                publicMarketData = currentMarket.get(),
+            ).block()
+            clock.advance(Duration.ofSeconds(10))
+            readyService.processTimer(
+                symbol = "BTCUSDT",
+                marketHealthy = true,
+                publicMarketData = currentMarket.get(),
+            ).block()
+
+            currentMarket.set(healthyMarketSnapshot("100.49", "100.51"))
+            readyService.process(
+                event = bookTicker("100.5"),
+                marketHealthy = true,
+                publicMarketData = currentMarket.get(),
+            ).block()
+            assertThat(readyService.currentState().single().state)
+                .isEqualTo(LevelState.APPROACH)
+
+            currentMarket.set(healthyMarketSnapshot("100.85", "100.95"))
+            listOf("100.5", "100.6", "100.7", "100.9")
+                .forEachIndexed { index, price ->
+                    readyService.process(
+                        event = tradeAt(
+                            id = index + 1L,
+                            price = price,
+                            receivedAt = clock.instant().minusMillis(
+                                200L - index * 50L,
+                            ),
+                        ),
+                        marketHealthy = true,
+                        publicMarketData = currentMarket.get(),
+                    ).block()
+                }
+            clock.advance(Duration.ofMillis(60))
+            readyService.processTimer(
+                symbol = "BTCUSDT",
+                marketHealthy = true,
+                publicMarketData = currentMarket.get(),
+            ).block()
+            val tooFar = readyService.currentState(
+                privateStreamReadiness = BinanceReadiness.READY,
+                publicMarketData = listOf(currentMarket.get()),
+            ).single()
+            assertThat(tooFar.signal.mandatoryGates.entryEligible)
+                .withFailMessage(
+                    "Unexpected blockers: %s",
+                    tooFar.signal.mandatoryGates.blockerReasons,
+                )
+                .isTrue()
+            assertThat(tooFar.signal.distanceToLevel)
+                .isEqualByComparingTo("0.3")
+            assertThat(levelFailure { readyService.prepare(created.id).block() }.code)
+                .isEqualTo(LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE)
+
+            currentMarket.set(healthyMarketSnapshot("101.05", "101.15"))
+            listOf("100.8", "100.9", "101.0", "101.1")
+                .forEachIndexed { index, price ->
+                    readyService.process(
+                        event = tradeAt(
+                            id = index + 5L,
+                            price = price,
+                            receivedAt = clock.instant().minusMillis(
+                                40L - index * 10L,
+                            ),
+                        ),
+                        marketHealthy = true,
+                        publicMarketData = currentMarket.get(),
+                    ).block()
+                }
+
+            globalState.set(GlobalTradingState.SAFE_MODE)
+            assertThat(levelFailure { readyService.prepare(created.id).block() }.code)
+                .isEqualTo(LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE)
+            assertThat(readyService.currentState().single().attemptConsumed)
+                .isFalse()
+
+            globalState.set(GlobalTradingState.RUNNING)
+            readyService.prepare(created.id).block()
+            currentMarket.set(healthyMarketSnapshot("101.04", "101.14"))
+            assertThat(
+                levelFailure { readyService.markDispatched(created.id).block() }.code,
+            ).isEqualTo(LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE)
+            assertThat(readyService.currentState().single().attemptConsumed)
+                .isFalse()
+
+            currentMarket.set(healthyMarketSnapshot("101.05", "101.15"))
+            val prepared = readyService.prepare(created.id).block()!!
+            assertThat(prepared.preEntryQuantity).isEqualByComparingTo("3")
+            assertThat(prepared.frozenNpu).isEqualByComparingTo("0.1")
+            assertThat(prepared.bestAskPrice).isEqualByComparingTo("101.15")
+            assertThat(prepared.precedingOneSecondTradePrices).isNotEmpty()
+            assertThat(readyService.currentState().single().attemptConsumed)
+                .isFalse()
+
+            readyService.markDispatched(created.id).block()
+            val pending = readyService.currentState(
+                privateStreamReadiness = BinanceReadiness.READY,
+                publicMarketData = listOf(currentMarket.get()),
+            ).single()
+            assertThat(pending.state).isEqualTo(LevelState.PRE_ENTRY_PENDING)
+            assertThat(pending.attemptConsumed).isTrue()
+            assertThat(pending.preEntryDispatchedAt).isEqualTo(clock.instant())
+            assertThat(
+                levelFailure { readyService.markDispatched(created.id).block() }.code,
+            ).isEqualTo(LevelReasonCode.LEVEL_ALREADY_CONSUMED)
+
+            readyService.markProtected(
+                levelId = created.id,
+                confirmedPositionQuantity = BigDecimal("2.4"),
+                hardStopClientOrderId = "hard-stop-1",
+                hardStopPrice = BigDecimal("99.7"),
+            ).block()
+            val protected = readyService.currentState(
+                privateStreamReadiness = BinanceReadiness.READY,
+                publicMarketData = listOf(currentMarket.get()),
+            ).single()
+            assertThat(protected.state).isEqualTo(LevelState.PRE_ENTRY)
+            assertThat(protected.confirmedPositionQuantity)
+                .isEqualByComparingTo("2.4")
+            assertThat(protected.hardStopPrice).isEqualByComparingTo("99.7")
+            assertThat(protected.hardStopConfirmedAt).isEqualTo(clock.instant())
+            assertThat(protected.hasUnresolvedOrder).isFalse()
+        } finally {
+            readyService.close()
+        }
+    }
+
     private fun bookTicker(midPrice: String): BookTickerEvent {
         val mid = BigDecimal(midPrice)
         return BookTickerEvent(
@@ -505,6 +655,43 @@ class LevelServiceTest {
             buyerIsMaker = false,
             aggressorSide = AggressorSide.BUY,
             receivedAt = clock.instant(),
+        )
+
+    private fun tradeAt(
+        id: Long,
+        price: String,
+        receivedAt: Instant,
+    ): AggregateTradeEvent =
+        AggregateTradeEvent(
+            symbol = "BTCUSDT",
+            aggregateTradeId = id,
+            eventTime = receivedAt,
+            tradeTime = receivedAt,
+            price = BigDecimal(price),
+            quantity = BigDecimal.ONE,
+            buyerIsMaker = false,
+            aggressorSide = AggressorSide.BUY,
+            receivedAt = receivedAt,
+        )
+
+    private fun healthyMarketSnapshot(
+        bid: String,
+        ask: String,
+    ): PublicMarketDataSnapshot =
+        PublicMarketDataSnapshot(
+            symbol = "BTCUSDT",
+            connectionState = PublicStreamConnectionState.CONNECTED,
+            healthy = true,
+            bidAskHeartbeatHealthy = true,
+            gapStatus = AggregateTradeGapStatus.CONTINUOUS,
+            latestAggregateTradeId = null,
+            latestBidPrice = BigDecimal(bid),
+            latestBidQuantity = BigDecimal.ONE,
+            latestAskPrice = BigDecimal(ask),
+            latestAskQuantity = BigDecimal.ONE,
+            spread = BigDecimal(ask).subtract(BigDecimal(bid)),
+            aggregateTradeAge = MarketEventAgeSnapshot(0, 0),
+            bookTickerAge = MarketEventAgeSnapshot(0, 0),
         )
 
     private fun command(

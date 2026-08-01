@@ -165,6 +165,14 @@ internal class SignalEngine(
             )
         }
 
+    fun tradePrices(
+        now: Instant,
+        duration: Duration,
+    ): List<BigDecimal> =
+        lock.withLock {
+            windowTrades(now, duration).map(AggregateTradeEvent::price)
+        }
+
     private fun sampleMidPrice(now: Instant) {
         val lastSampleAt = midPriceSamples.lastOrNull()?.sampledAt
         if (

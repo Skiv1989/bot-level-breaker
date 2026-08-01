@@ -9,6 +9,8 @@ import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.domain.BinanceReadiness
 import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
 import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
+import com.scalpsecta.breakoutbot.execution.PreEntryLevelCoordinator
+import com.scalpsecta.breakoutbot.execution.PreEntryOpportunity
 import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
 import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
@@ -16,12 +18,15 @@ import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSubscription
 import com.scalpsecta.breakoutbot.signal.LevelSignalTracker
 import com.scalpsecta.breakoutbot.signal.NpuMode
+import com.scalpsecta.breakoutbot.risk.AttemptRiskService
+import com.scalpsecta.breakoutbot.service.AuthenticatedBinanceReadinessService
 import jakarta.annotation.PreDestroy
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import reactor.core.Disposable
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
+import reactor.core.publisher.Sinks
 import reactor.core.scheduler.Scheduler
 import reactor.core.scheduler.Schedulers
 import java.math.BigDecimal
@@ -43,19 +48,43 @@ class LevelService internal constructor(
     private val clock: Clock,
     private val automaticTimers: Boolean,
     private val evidenceRecorder: EvidenceRecorder = NoOpEvidenceRecorder,
-) {
+    private val privateStreamReadinessProvider: () -> BinanceReadiness = {
+        BinanceReadiness.NOT_READY
+    },
+    private val globalTradingStateProvider: () -> GlobalTradingState = {
+        GlobalTradingState.RUNNING
+    },
+    private val publicMarketDataProvider: (String) -> PublicMarketDataSnapshot? =
+        { symbol ->
+            publicMarketDataService
+                .snapshots()
+                .firstOrNull { snapshot -> snapshot.symbol == symbol }
+        },
+) : PreEntryLevelCoordinator {
     @Autowired
     constructor(
         client: AuthenticatedBinanceClient,
         publicMarketDataService: PublicMarketDataService,
         clock: Clock,
         evidenceRecorder: EvidenceRecorder,
+        authenticatedBinanceReadinessService:
+            AuthenticatedBinanceReadinessService,
+        attemptRiskService: AttemptRiskService,
     ) : this(
         client = client,
         publicMarketDataService = publicMarketDataService,
         clock = clock,
         automaticTimers = true,
         evidenceRecorder = evidenceRecorder,
+        privateStreamReadinessProvider = {
+            authenticatedBinanceReadinessService
+                .snapshot()
+                .privateStream
+                .readiness
+        },
+        globalTradingStateProvider = {
+            attemptRiskService.currentState().globalTradingState
+        },
     )
 
     private val lock = ReentrantLock()
@@ -64,6 +93,10 @@ class LevelService internal constructor(
     private val symbolConfigurationPermits =
         ConcurrentHashMap<String, Semaphore>()
     private val eventScheduler: Scheduler = Schedulers.newParallel("level-events")
+    private val preEntryOpportunitySink = Sinks
+        .many()
+        .multicast()
+        .onBackpressureBuffer<UUID>()
 
     fun create(command: CreateLevelCommand): Mono<LevelSnapshot> =
         Mono.defer {
@@ -169,13 +202,14 @@ class LevelService internal constructor(
     internal fun process(
         event: AggregateTradeEvent,
         marketHealthy: Boolean,
+        publicMarketData: PublicMarketDataSnapshot? = null,
     ): Mono<Void> =
         submitSymbolEvent(
             symbol = event.symbol,
             event = SymbolLevelEvent.AggregateTrade(
                 event = event,
                 processedAt = clock.instant(),
-                publicMarketData = null,
+                publicMarketData = publicMarketData,
                 marketHealthy = marketHealthy,
             ),
         )
@@ -183,13 +217,14 @@ class LevelService internal constructor(
     internal fun process(
         event: BookTickerEvent,
         marketHealthy: Boolean,
+        publicMarketData: PublicMarketDataSnapshot? = null,
     ): Mono<Void> =
         submitSymbolEvent(
             symbol = event.symbol,
             event = SymbolLevelEvent.BookTicker(
                 event = event,
                 processedAt = clock.instant(),
-                publicMarketData = null,
+                publicMarketData = publicMarketData,
                 marketHealthy = marketHealthy,
             ),
         )
@@ -197,12 +232,13 @@ class LevelService internal constructor(
     internal fun processTimer(
         symbol: String,
         marketHealthy: Boolean,
+        publicMarketData: PublicMarketDataSnapshot? = null,
     ): Mono<Void> =
         submitSymbolEvent(
             symbol = symbol,
             event = SymbolLevelEvent.Timer(
                 processedAt = clock.instant(),
-                publicMarketData = null,
+                publicMarketData = publicMarketData,
                 marketHealthy = marketHealthy,
             ),
         )
@@ -221,6 +257,113 @@ class LevelService internal constructor(
             ),
         )
 
+    override fun opportunities(): Flux<UUID> =
+        preEntryOpportunitySink.asFlux()
+
+    override fun prepare(levelId: UUID): Mono<PreEntryOpportunity> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.PreparePreEntry(
+                    levelId = levelId,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).map { result -> result as PreEntryOpportunity }
+
+    override fun markDispatched(levelId: UUID): Mono<Void> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.PreEntryDispatched(
+                    levelId = levelId,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).then()
+
+    override fun cancelPreparation(levelId: UUID): Mono<Void> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.CancelPreEntryPreparation(
+                    levelId = levelId,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).then()
+
+    override fun crossedBeforeProtection(levelId: UUID): Boolean =
+        lock.withLock {
+            levels[levelId]?.snapshot?.let { snapshot ->
+                snapshot.state == LevelState.TERMINAL &&
+                    snapshot.terminalReason ==
+                    LevelReasonCode.CROSS_BEFORE_PROTECTED
+            } ?: false
+        }
+
+    override fun markProtected(
+        levelId: UUID,
+        confirmedPositionQuantity: BigDecimal,
+        hardStopClientOrderId: String,
+        hardStopPrice: BigDecimal,
+    ): Mono<Void> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.PreEntryProtected(
+                    levelId = levelId,
+                    confirmedPositionQuantity = confirmedPositionQuantity,
+                    hardStopClientOrderId = hardStopClientOrderId,
+                    hardStopPrice = hardStopPrice,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).then()
+
+    override fun terminate(
+        levelId: UUID,
+        reason: LevelReasonCode,
+        confirmedRemainingQuantity: BigDecimal,
+        hasUnresolvedOrder: Boolean,
+    ): Mono<Void> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.TerminatePreEntry(
+                    levelId = levelId,
+                    reason = reason,
+                    confirmedRemainingQuantity = confirmedRemainingQuantity,
+                    hasUnresolvedOrder = hasUnresolvedOrder,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).then()
+
+    private fun submitPreEntryEvent(
+        levelId: UUID,
+        event: (PublicMarketDataSnapshot?) -> SymbolLevelEvent,
+    ): Mono<Any> {
+        val symbolRuntime = lock.withLock {
+            val symbol = levels[levelId]?.snapshot?.symbol ?: throw levelError(
+                LevelReasonCode.LEVEL_NOT_FOUND,
+                "Level $levelId does not exist",
+            )
+            checkNotNull(symbolRuntimes[symbol]) {
+                "Event queue for $symbol is missing"
+            }.also { it.pendingEvents += 1 }
+        }
+        return submit(
+            runtime = symbolRuntime,
+            event = event(publicMarketData(levelId)),
+        )
+    }
+
     @PreDestroy
     fun close() {
         val runtimes = lock.withLock {
@@ -230,6 +373,7 @@ class LevelService internal constructor(
             }
         }
         symbolConfigurationPermits.clear()
+        preEntryOpportunitySink.tryEmitComplete()
         runtimes.forEach(SymbolRuntime::close)
         eventScheduler.dispose()
     }
@@ -264,33 +408,70 @@ class LevelService internal constructor(
                 is SymbolLevelEvent.AddLevel -> addLevel(event)
                 is SymbolLevelEvent.DeleteLevel -> deleteLevel(event)
                 is SymbolLevelEvent.UpdateOwnership -> updateOwnership(event)
+                is SymbolLevelEvent.PreparePreEntry -> preparePreEntry(event)
+                is SymbolLevelEvent.PreEntryDispatched ->
+                    recordPreEntryDispatch(event)
+
+                is SymbolLevelEvent.CancelPreEntryPreparation ->
+                    cancelPreEntryPreparation(event)
+
+                is SymbolLevelEvent.PreEntryProtected ->
+                    recordPreEntryProtection(event)
+
+                is SymbolLevelEvent.TerminatePreEntry ->
+                    terminatePreEntry(event)
+
                 is SymbolLevelEvent.AggregateTrade -> {
                     evidenceRecorder.record(event.event)
                     levelsForSymbol(symbol).forEach { stored ->
                         val before = stored.snapshot
                         stored.signalTracker.record(event.event)
-                        if (
+                        when {
+                            stored.snapshot.state ==
+                                LevelState.PRE_ENTRY_PENDING &&
+                                crossesLevel(stored, event.event.price) ->
+                                transitionToTerminal(
+                                    stored = stored,
+                                    processedAt = event.processedAt,
+                                    reason =
+                                        LevelReasonCode.CROSS_BEFORE_PROTECTED,
+                                )
+
+                            stored.preEntryPreparationInProgress &&
+                                crossesLevel(stored, event.event.price) ->
+                                transitionToTerminal(
+                                    stored = stored,
+                                    processedAt = event.processedAt,
+                                    reason = LevelReasonCode.LEVEL_ALREADY_CROSSED,
+                                )
+
                             stored.snapshot.state == LevelState.WARMING_UP &&
-                            crossesLevel(stored, event.event.price)
-                        ) {
-                            transitionToMissed(stored, event.processedAt)
-                        } else {
-                            advanceWarmup(
-                                stored = stored,
-                                processedAt = event.processedAt,
-                                marketHealthy = event.marketHealthy,
-                            )
-                            enterApproachIfEligible(
-                                stored = stored,
-                                referencePrice = event.event.price,
-                                processedAt = event.processedAt,
-                                publicMarketData = event.publicMarketData,
-                            )
+                                crossesLevel(stored, event.event.price) ->
+                                transitionToMissed(stored, event.processedAt)
+
+                            else -> {
+                                advanceWarmup(
+                                    stored = stored,
+                                    processedAt = event.processedAt,
+                                    marketHealthy = event.marketHealthy,
+                                )
+                                enterApproachIfEligible(
+                                    stored = stored,
+                                    referencePrice = event.event.price,
+                                    processedAt = event.processedAt,
+                                    publicMarketData = event.publicMarketData,
+                                )
+                            }
                         }
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
                         recordStateTransition(
                             before = before,
                             after = stored.snapshot,
+                            publicMarketData = event.publicMarketData,
+                        )
+                        publishPreEntryOpportunity(
+                            stored = stored,
+                            now = event.processedAt,
                             publicMarketData = event.publicMarketData,
                         )
                     }
@@ -322,6 +503,11 @@ class LevelService internal constructor(
                             after = stored.snapshot,
                             publicMarketData = event.publicMarketData,
                         )
+                        publishPreEntryOpportunity(
+                            stored = stored,
+                            now = event.processedAt,
+                            publicMarketData = event.publicMarketData,
+                        )
                     }
                     Unit
                 }
@@ -338,7 +524,8 @@ class LevelService internal constructor(
                         )
                         val referencePrice = stored.signalTracker.snapshot(
                             publicMarketData = event.publicMarketData,
-                            privateStreamReadiness = BinanceReadiness.NOT_READY,
+                            privateStreamReadiness =
+                                privateStreamReadinessProvider(),
                             hasUnresolvedOrder = stored.snapshot.hasUnresolvedOrder,
                             now = event.processedAt,
                         ).midPrice
@@ -354,6 +541,11 @@ class LevelService internal constructor(
                         recordStateTransition(
                             before = before,
                             after = stored.snapshot,
+                            publicMarketData = event.publicMarketData,
+                        )
+                        publishPreEntryOpportunity(
+                            stored = stored,
+                            now = event.processedAt,
                             publicMarketData = event.publicMarketData,
                         )
                     }
@@ -406,6 +598,13 @@ class LevelService internal constructor(
             globalState = GlobalTradingState.RUNNING,
             blockers = listOf(LevelBlocker.WARMING_UP),
             signal = initialSignal,
+            attemptNumber = 1,
+            attemptConsumed = false,
+            preEntryDispatchedAt = null,
+            confirmedPositionQuantity = BigDecimal.ZERO,
+            hardStopPrice = null,
+            hardStopClientOrderId = null,
+            hardStopConfirmedAt = null,
             ownsActiveAttempt = false,
             ownsExposure = false,
             hasUnresolvedOrder = false,
@@ -415,6 +614,7 @@ class LevelService internal constructor(
             key = event.plan.key,
             snapshot = snapshot,
             signalTracker = tracker,
+            tickSize = event.plan.tickSize,
         )
         levels[snapshot.id] = stored
         return currentSnapshot(
@@ -512,6 +712,208 @@ class LevelService internal constructor(
         }
     }
 
+    private fun preparePreEntry(
+        event: SymbolLevelEvent.PreparePreEntry,
+    ): PreEntryOpportunity {
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        if (stored.preEntryPreparationInProgress) {
+            throw levelError(
+                LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE,
+                "Pre-entry preparation is already in progress for ${event.levelId}",
+            )
+        }
+        refreshSignal(
+            stored = stored,
+            now = event.processedAt,
+            publicMarketData = event.publicMarketData,
+        )
+        val opportunity = buildPreEntryOpportunity(
+            stored = stored,
+            now = event.processedAt,
+            publicMarketData = event.publicMarketData,
+        ) ?: throw levelError(
+            LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE,
+            "Level ${event.levelId} is not eligible for pre-entry",
+        )
+        stored.preEntryPreparationInProgress = true
+        stored.preparedOpportunity = opportunity
+        return opportunity
+    }
+
+    private fun recordPreEntryDispatch(
+        event: SymbolLevelEvent.PreEntryDispatched,
+    ): LevelSnapshot {
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        if (
+            stored.snapshot.state != LevelState.APPROACH ||
+            stored.snapshot.attemptConsumed ||
+            !stored.preEntryPreparationInProgress ||
+            stored.preparedOpportunity == null
+        ) {
+            throw levelError(
+                LevelReasonCode.LEVEL_ALREADY_CONSUMED,
+                "Level ${event.levelId} cannot dispatch another pre-entry",
+            )
+        }
+        refreshSignal(
+            stored = stored,
+            now = event.processedAt,
+            publicMarketData = event.publicMarketData,
+        )
+        val preparedOpportunity = checkNotNull(stored.preparedOpportunity)
+        val currentOpportunity = buildPreEntryOpportunity(
+            stored = stored,
+            now = event.processedAt,
+            publicMarketData = event.publicMarketData,
+            ignorePreparation = true,
+        )
+        if (
+            currentOpportunity == null ||
+            currentOpportunity.copy(
+                preparedAt = preparedOpportunity.preparedAt,
+            ) != preparedOpportunity
+        ) {
+            stored.preEntryPreparationInProgress = false
+            stored.preparedOpportunity = null
+            throw levelError(
+                LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE,
+                "Pre-entry conditions changed before dispatch for ${event.levelId}",
+            )
+        }
+        val before = stored.snapshot
+        stored.preEntryPreparationInProgress = false
+        stored.preparedOpportunity = null
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.PRE_ENTRY_PENDING,
+            stateChangedAt = event.processedAt,
+            terminalReason = null,
+            attemptConsumed = true,
+            preEntryDispatchedAt = event.processedAt,
+            ownsActiveAttempt = true,
+            hasUnresolvedOrder = true,
+            deleteAllowed = false,
+        )
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        ).also { after ->
+            stored.snapshot = after
+            recordStateTransition(before, after, event.publicMarketData)
+        }
+    }
+
+    private fun cancelPreEntryPreparation(
+        event: SymbolLevelEvent.CancelPreEntryPreparation,
+    ) {
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        stored.preEntryPreparationInProgress = false
+        stored.preparedOpportunity = null
+        refreshSignal(stored, event.processedAt, event.publicMarketData)
+    }
+
+    private fun recordPreEntryProtection(
+        event: SymbolLevelEvent.PreEntryProtected,
+    ): LevelSnapshot {
+        require(event.confirmedPositionQuantity.signum() > 0) {
+            "confirmedPositionQuantity must be positive"
+        }
+        require(event.hardStopClientOrderId.isNotBlank()) {
+            "hardStopClientOrderId must not be blank"
+        }
+        require(event.hardStopPrice.signum() > 0) {
+            "hardStopPrice must be positive"
+        }
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        if (stored.snapshot.state != LevelState.PRE_ENTRY_PENDING) {
+            throw levelError(
+                LevelReasonCode.PRE_ENTRY_NOT_ELIGIBLE,
+                "Level ${event.levelId} is no longer awaiting pre-entry protection",
+            )
+        }
+        val before = stored.snapshot
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.PRE_ENTRY,
+            stateChangedAt = event.processedAt,
+            terminalReason = null,
+            confirmedPositionQuantity = event.confirmedPositionQuantity,
+            hardStopPrice = event.hardStopPrice,
+            hardStopClientOrderId = event.hardStopClientOrderId,
+            hardStopConfirmedAt = event.processedAt,
+            ownsActiveAttempt = true,
+            ownsExposure = true,
+            hasUnresolvedOrder = false,
+            deleteAllowed = false,
+        )
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        ).also { after ->
+            stored.snapshot = after
+            recordStateTransition(before, after, event.publicMarketData)
+        }
+    }
+
+    private fun terminatePreEntry(
+        event: SymbolLevelEvent.TerminatePreEntry,
+    ): LevelSnapshot {
+        require(event.confirmedRemainingQuantity.signum() >= 0) {
+            "confirmedRemainingQuantity must not be negative"
+        }
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        val before = stored.snapshot
+        stored.preEntryPreparationInProgress = false
+        stored.preparedOpportunity = null
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.TERMINAL,
+            stateChangedAt = if (before.state == LevelState.TERMINAL) {
+                before.stateChangedAt
+            } else {
+                event.processedAt
+            },
+            terminalReason = event.reason,
+            confirmedPositionQuantity = event.confirmedRemainingQuantity,
+            ownsActiveAttempt =
+                event.confirmedRemainingQuantity.signum() > 0 ||
+                    event.hasUnresolvedOrder,
+            ownsExposure = event.confirmedRemainingQuantity.signum() > 0,
+            hasUnresolvedOrder = event.hasUnresolvedOrder,
+            deleteAllowed =
+                event.confirmedRemainingQuantity.signum() == 0 &&
+                    !event.hasUnresolvedOrder,
+        )
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        ).also { after ->
+            stored.snapshot = after
+            recordStateTransition(before, after, event.publicMarketData)
+        }
+    }
+
     private fun advanceWarmup(
         stored: StoredLevel,
         processedAt: Instant,
@@ -569,11 +971,122 @@ class LevelService internal constructor(
         )
     }
 
+    private fun publishPreEntryOpportunity(
+        stored: StoredLevel,
+        now: Instant,
+        publicMarketData: PublicMarketDataSnapshot?,
+    ) {
+        if (stored.preEntryPreparationInProgress) {
+            return
+        }
+        if (
+            buildPreEntryOpportunity(
+                stored = stored,
+                now = now,
+                publicMarketData = publicMarketData,
+            ) != null
+        ) {
+            preEntryOpportunitySink.tryEmitNext(stored.snapshot.id)
+        }
+    }
+
+    private fun buildPreEntryOpportunity(
+        stored: StoredLevel,
+        now: Instant,
+        publicMarketData: PublicMarketDataSnapshot?,
+        ignorePreparation: Boolean = false,
+    ): PreEntryOpportunity? {
+        val snapshot = currentSnapshot(
+            stored = stored,
+            publicMarketData = publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = now,
+        )
+        stored.snapshot = snapshot
+        if (
+            snapshot.state != LevelState.APPROACH ||
+            snapshot.attemptConsumed ||
+            (!ignorePreparation && stored.preEntryPreparationInProgress) ||
+            snapshot.globalState != GlobalTradingState.RUNNING ||
+            snapshot.blockers.isNotEmpty() ||
+            !snapshot.signal.mandatoryGates.entryEligible ||
+            !snapshot.signal.npu.frozen
+        ) {
+            return null
+        }
+        val frozenNpu = snapshot.signal.npu.absolute ?: return null
+        val referencePrice = snapshot.signal.latestTradePrice ?: return null
+        val preBreakDistance = when (snapshot.direction) {
+            LevelDirection.LONG -> if (
+                referencePrice < snapshot.normalizedLevelPrice
+            ) {
+                snapshot.normalizedLevelPrice.subtract(referencePrice)
+            } else {
+                null
+            }
+
+            LevelDirection.SHORT -> if (
+                referencePrice > snapshot.normalizedLevelPrice
+            ) {
+                referencePrice.subtract(snapshot.normalizedLevelPrice)
+            } else {
+                null
+            }
+        } ?: return null
+        if (preBreakDistance > frozenNpu.multiply(PRE_ENTRY_NPU_MULTIPLIER)) {
+            return null
+        }
+        val bestBidPrice = snapshot.signal.bidPrice ?: return null
+        val bestAskPrice = snapshot.signal.askPrice ?: return null
+        val precedingTradePrices = stored.signalTracker.tradePrices(
+            now = now,
+            duration = PRE_ENTRY_MICRO_SWING_WINDOW,
+        )
+        if (precedingTradePrices.isEmpty()) {
+            return null
+        }
+        val preEntryQuantity = snapshot.entryAllocation
+            .single { tranche -> tranche.role == LevelEntryRole.PRE_BREAK }
+            .quantity
+        return PreEntryOpportunity(
+            levelId = snapshot.id,
+            attemptNumber = snapshot.attemptNumber,
+            symbol = snapshot.symbol,
+            direction = snapshot.direction,
+            levelPrice = snapshot.normalizedLevelPrice,
+            positionNotionalUsdt = snapshot.positionNotionalUsdt,
+            plannedQuantity = snapshot.plannedQuantity,
+            preEntryQuantity = preEntryQuantity,
+            maxImpulsePct = snapshot.maxImpulsePct,
+            frozenNpu = frozenNpu,
+            precedingOneSecondTradePrices = precedingTradePrices,
+            bestBidPrice = bestBidPrice,
+            bestAskPrice = bestAskPrice,
+            tickSize = stored.tickSize,
+            preparedAt = now,
+        )
+    }
+
     private fun transitionToMissed(stored: StoredLevel, processedAt: Instant) {
+        transitionToTerminal(
+            stored = stored,
+            processedAt = processedAt,
+            reason = LevelReasonCode.MISSED_DURING_WARMUP,
+        )
+    }
+
+    private fun transitionToTerminal(
+        stored: StoredLevel,
+        processedAt: Instant,
+        reason: LevelReasonCode,
+    ) {
+        stored.preEntryPreparationInProgress = false
+        stored.preparedOpportunity = null
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.TERMINAL,
             stateChangedAt = processedAt,
-            terminalReason = LevelReasonCode.MISSED_DURING_WARMUP,
+            terminalReason = reason,
         )
     }
 
@@ -594,8 +1107,8 @@ class LevelService internal constructor(
         stored.snapshot = currentSnapshot(
             stored = stored,
             publicMarketData = publicMarketData,
-            privateStreamReadiness = BinanceReadiness.NOT_READY,
-            globalState = GlobalTradingState.RUNNING,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
             now = now,
         )
     }
@@ -611,6 +1124,8 @@ class LevelService internal constructor(
         val decision = when (after.state) {
             LevelState.ARMED -> "WARMUP_COMPLETE"
             LevelState.APPROACH -> "ACTIVATION_BAND_ENTERED"
+            LevelState.PRE_ENTRY_PENDING -> "PRE_ENTRY_DISPATCHED"
+            LevelState.PRE_ENTRY -> "HARD_STOP_CONFIRMED"
             LevelState.TERMINAL ->
                 after.terminalReason?.name ?: "ATTEMPT_TERMINAL"
 
@@ -1258,9 +1773,7 @@ class LevelService internal constructor(
     }
 
     private fun currentPublicMarketData(symbol: String): PublicMarketDataSnapshot? =
-        publicMarketDataService
-            .snapshots()
-            .firstOrNull { snapshot -> snapshot.symbol == symbol }
+        publicMarketDataProvider(symbol)
 
     private fun currentSnapshot(
         stored: StoredLevel,
@@ -1290,6 +1803,8 @@ class LevelService internal constructor(
                 LevelState.TERMINAL -> add(LevelBlocker.TERMINAL)
                 LevelState.ARMED,
                 LevelState.APPROACH,
+                LevelState.PRE_ENTRY_PENDING,
+                LevelState.PRE_ENTRY,
                 -> Unit
             }
             when (globalState) {
@@ -1339,7 +1854,10 @@ private data class StoredLevel(
     val key: LevelKey,
     var snapshot: LevelSnapshot,
     val signalTracker: LevelSignalTracker,
+    val tickSize: BigDecimal,
     var npuMode: NpuMode = NpuMode.WARMING_UP,
+    var preEntryPreparationInProgress: Boolean = false,
+    var preparedOpportunity: PreEntryOpportunity? = null,
 ) {
     fun claimsSymbolOwnership(): Boolean =
         snapshot.ownsActiveAttempt ||
@@ -1425,6 +1943,42 @@ private sealed interface SymbolLevelEvent {
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent
 
+    data class PreparePreEntry(
+        val levelId: UUID,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class PreEntryDispatched(
+        val levelId: UUID,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class CancelPreEntryPreparation(
+        val levelId: UUID,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class PreEntryProtected(
+        val levelId: UUID,
+        val confirmedPositionQuantity: BigDecimal,
+        val hardStopClientOrderId: String,
+        val hardStopPrice: BigDecimal,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class TerminatePreEntry(
+        val levelId: UUID,
+        val reason: LevelReasonCode,
+        val confirmedRemainingQuantity: BigDecimal,
+        val hasUnresolvedOrder: Boolean,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
     data class AggregateTrade(
         val event: AggregateTradeEvent,
         val processedAt: Instant,
@@ -1467,6 +2021,8 @@ private const val CALCULATION_SCALE = 16
 private val EVENT_SAMPLE_INTERVAL: Duration = Duration.ofMillis(100)
 private val WARMUP_DURATION: Duration = Duration.ofSeconds(10)
 private val ACTIVATION_NPU_MULTIPLIER = BigDecimal("8")
+private val PRE_ENTRY_NPU_MULTIPLIER = BigDecimal("2")
+private val PRE_ENTRY_MICRO_SWING_WINDOW: Duration = Duration.ofSeconds(1)
 private val TWO = BigDecimal("2")
 private val THIRTY_PERCENT = BigDecimal("0.30")
 private val ONE_PERCENT = BigDecimal("0.01")

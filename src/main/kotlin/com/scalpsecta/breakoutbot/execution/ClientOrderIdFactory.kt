@@ -36,6 +36,8 @@ class ClientOrderIdFactory internal constructor(
             confirmedQuantity = request.confirmedQuantity,
             price = request.price,
             stopPrice = request.stopPrice,
+            workingType = request.workingType,
+            priceProtect = request.priceProtect,
             reduceOnly = request.reduceOnly,
             closePosition = request.closePosition,
             confirmedPositionAmount = request.confirmedPositionAmount,
@@ -118,6 +120,38 @@ class ClientOrderIdFactory internal constructor(
                 "market orders must not specify timeInForce",
             )
         }
+        if (
+            request.type in STOP_ORDER_TYPES &&
+            request.stopPrice == null
+        ) {
+            throw OrderExecutionException(
+                "stop orders require stopPrice",
+            )
+        }
+        if (request.type !in STOP_ORDER_TYPES && request.stopPrice != null) {
+            throw OrderExecutionException(
+                "non-stop orders cannot specify stopPrice",
+            )
+        }
+        if (request.role == OrderRole.HARD_STOP) {
+            if (
+                request.type != OrderType.STOP_MARKET ||
+                !request.closePosition ||
+                request.workingType != TriggerWorkingType.CONTRACT_PRICE ||
+                request.priceProtect != false
+            ) {
+                throw OrderExecutionException(
+                    "hard stops require a close-position STOP_MARKET using CONTRACT_PRICE with price protection disabled",
+                )
+            }
+        } else if (
+            request.workingType != null ||
+            request.priceProtect != null
+        ) {
+            throw OrderExecutionException(
+                "trigger configuration is supported only for hard stops",
+            )
+        }
     }
 
     private fun validateClosingIntent(request: OrderIntentRequest) {
@@ -173,3 +207,9 @@ private const val BASE_36 = 36
 private const val LEVEL_ID_LENGTH = 7
 private const val MAX_CLIENT_ORDER_ID_LENGTH = 36
 private val BINANCE_CLIENT_ORDER_ID = Regex("^[.A-Za-z0-9_:/-]{1,36}$")
+private val STOP_ORDER_TYPES = setOf(
+    OrderType.STOP,
+    OrderType.STOP_MARKET,
+    OrderType.TAKE_PROFIT,
+    OrderType.TAKE_PROFIT_MARKET,
+)

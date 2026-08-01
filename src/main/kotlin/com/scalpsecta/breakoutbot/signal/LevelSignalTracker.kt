@@ -7,6 +7,7 @@ import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 
 internal class LevelSignalTracker(
@@ -41,4 +42,7 @@ internal class LevelSignalTracker(
     fun record(event: BookTickerEvent) = engine.record(event)
 
     fun tick(now: Instant, mode: NpuMode) = engine.tick(now, mode)
+
+    fun tradePrices(now: Instant, duration: Duration): List<BigDecimal> =
+        engine.tradePrices(now, duration)
 }

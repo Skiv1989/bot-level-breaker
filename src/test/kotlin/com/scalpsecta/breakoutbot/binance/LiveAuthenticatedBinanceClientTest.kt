@@ -291,6 +291,48 @@ class LiveAuthenticatedBinanceClientTest {
     }
 
     @Test
+    fun `execution client sends close-all contract-price stop without price protection`() {
+        val exchange = RecordingExchange {
+            response(
+                body =
+                    """
+                    {
+                      "symbol":"BTCUSDT",
+                      "clientOrderId":"hard-stop-client-id",
+                      "orderId":43,
+                      "status":"NEW"
+                    }
+                    """.trimIndent(),
+            )
+        }
+        val client = client(exchange) as BinanceExecutionClient
+
+        client.placeOrder(
+            BinanceOrderRequest(
+                symbol = "BTCUSDT",
+                clientOrderId = "hard-stop-client-id",
+                side = "SELL",
+                type = "STOP_MARKET",
+                stopPrice = BigDecimal("65000.00"),
+                workingType = "CONTRACT_PRICE",
+                priceProtect = false,
+                closePosition = true,
+            ),
+        ).block()
+
+        val query = UriComponentsBuilder
+            .fromUri(exchange.requests.single().url())
+            .build()
+            .queryParams
+        assertThat(query.getFirst("type")).isEqualTo("STOP_MARKET")
+        assertThat(query.getFirst("stopPrice")).isEqualTo("65000.00")
+        assertThat(query.getFirst("workingType")).isEqualTo("CONTRACT_PRICE")
+        assertThat(query.getFirst("priceProtect")).isEqualTo("false")
+        assertThat(query.getFirst("closePosition")).isEqualTo("true")
+        assertThat(query).doesNotContainKeys("quantity", "reduceOnly")
+    }
+
+    @Test
     fun `Binance errors do not expose credentials signatures or response bodies`() {
         val exchange = RecordingExchange {
             response(

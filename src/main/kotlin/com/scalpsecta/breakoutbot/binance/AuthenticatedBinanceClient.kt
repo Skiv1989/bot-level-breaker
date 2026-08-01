@@ -315,6 +315,12 @@ class LiveAuthenticatedBinanceClient(
         request.stopPrice?.let {
             parameters["stopPrice"] = it.toPlainString()
         }
+        request.workingType?.let {
+            parameters["workingType"] = it
+        }
+        request.priceProtect?.let {
+            parameters["priceProtect"] = it.toString()
+        }
         parameters["newClientOrderId"] = request.clientOrderId
         if (request.reduceOnly) {
             parameters["reduceOnly"] = true.toString()
@@ -523,6 +529,10 @@ class LiveAuthenticatedBinanceClient(
             reduceOnly = payload.requiredBoolean("reduceOnly"),
             closePosition = payload.requiredBoolean("closePosition"),
             updatedAt = Instant.ofEpochMilli(payload.requiredLong("updateTime")),
+            type = payload.optionalText("type"),
+            stopPrice = payload.optionalDecimal("stopPrice"),
+            workingType = payload.optionalText("workingType"),
+            priceProtect = payload.optionalBoolean("priceProtect"),
         )
 
     private fun parsePositionRisk(
@@ -568,6 +578,12 @@ class LiveAuthenticatedBinanceClient(
         }
         require(!request.closePosition || !request.reduceOnly) {
             "close-position orders must not also be reduce-only"
+        }
+        require(request.workingType == null || request.stopPrice != null) {
+            "workingType requires stopPrice"
+        }
+        require(request.priceProtect == null || request.stopPrice != null) {
+            "priceProtect requires stopPrice"
         }
     }
 
@@ -625,6 +641,12 @@ private fun JsonNode.requiredDecimal(name: String): BigDecimal =
 
 private fun JsonNode.optionalDecimal(name: String): BigDecimal? =
     get(name)?.takeUnless(JsonNode::isNull)?.asText()?.toBigDecimal()
+
+private fun JsonNode.optionalText(name: String): String? =
+    get(name)?.takeUnless(JsonNode::isNull)?.asText()
+
+private fun JsonNode.optionalBoolean(name: String): Boolean? =
+    get(name)?.takeUnless(JsonNode::isNull)?.asBoolean()
 
 private const val LIVE_REST_BASE_URL = "https://fapi.binance.com"
 private const val SERVER_TIME_PATH = "/fapi/v1/time"

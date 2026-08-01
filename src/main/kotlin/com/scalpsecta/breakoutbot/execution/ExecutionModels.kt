@@ -1,5 +1,6 @@
 package com.scalpsecta.breakoutbot.execution
 
+import reactor.core.publisher.Mono
 import java.math.BigDecimal
 import java.time.Instant
 import java.util.UUID
@@ -16,6 +17,8 @@ data class OrderIntentRequest(
     val confirmedQuantity: BigDecimal? = null,
     val price: BigDecimal? = null,
     val stopPrice: BigDecimal? = null,
+    val workingType: TriggerWorkingType? = null,
+    val priceProtect: Boolean? = null,
     val reduceOnly: Boolean = false,
     val closePosition: Boolean = false,
     val confirmedPositionAmount: BigDecimal? = null,
@@ -36,6 +39,8 @@ data class OrderIntent(
     val confirmedQuantity: BigDecimal?,
     val price: BigDecimal?,
     val stopPrice: BigDecimal?,
+    val workingType: TriggerWorkingType?,
+    val priceProtect: Boolean?,
     val reduceOnly: Boolean,
     val closePosition: Boolean,
     val confirmedPositionAmount: BigDecimal?,
@@ -73,7 +78,13 @@ enum class OrderTimeInForce {
     FOK,
 }
 
+enum class TriggerWorkingType {
+    CONTRACT_PRICE,
+    MARK_PRICE,
+}
+
 enum class OrderOutcome {
+    ACTIVE,
     FILLED,
     PARTIALLY_FILLED,
     REJECTED,
@@ -101,7 +112,19 @@ data class OrderResolution(
 
 enum class ExecutionReasonCode {
     ORDER_OUTCOME_UNKNOWN,
+    STOP_SETUP_FAILED,
 }
+
+data class HardStopConfirmation(
+    val intent: OrderIntent,
+    val confirmed: Boolean,
+    val exchangeOrderId: Long?,
+    val observedStopPrice: BigDecimal?,
+    val observedWorkingType: TriggerWorkingType?,
+    val observedPriceProtect: Boolean?,
+    val reconciliationChecks: Int,
+    val confirmedPositionAmount: BigDecimal,
+)
 
 data class ExecutionSnapshot(
     val observedAt: Instant,
@@ -133,6 +156,9 @@ data class OrderExecutionSnapshot(
     val role: OrderRole,
     val slot: Int,
     val requestedQuantity: BigDecimal?,
+    val stopPrice: BigDecimal?,
+    val workingType: TriggerWorkingType?,
+    val priceProtect: Boolean?,
     val actualFilledQuantity: BigDecimal,
     val outcome: OrderOutcome?,
     val source: OrderResolutionSource?,
@@ -142,3 +168,11 @@ data class OrderExecutionSnapshot(
 )
 
 class OrderExecutionException(message: String) : IllegalArgumentException(message)
+
+interface PreEntryOrderExecutor {
+    fun execute(request: OrderIntentRequest): Mono<OrderResolution>
+
+    fun confirmHardStop(
+        request: OrderIntentRequest,
+    ): Mono<HardStopConfirmation>
+}

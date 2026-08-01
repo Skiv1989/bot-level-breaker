@@ -32,6 +32,8 @@ import java.time.Clock
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 @Service
 class ExecutionService internal constructor(
@@ -45,7 +47,8 @@ class ExecutionService internal constructor(
     private val scheduler: Scheduler,
     private val requestTimeout: Duration,
     private val reconciliationInterval: Duration,
-) {
+    private val stopConfirmationTimeout: Duration = Duration.ofSeconds(2),
+) : PreEntryOrderExecutor {
     @Autowired
     constructor(
         client: BinanceExecutionClient,
@@ -59,6 +62,8 @@ class ExecutionService internal constructor(
         requestTimeout: Duration,
         @Value("\${bot.execution.reconciliation-interval:1s}")
         reconciliationInterval: Duration,
+        @Value("\${bot.execution.stop-confirmation-timeout:2s}")
+        stopConfirmationTimeout: Duration,
     ) : this(
         client = client,
         privateEvents = readinessService.events(),
@@ -70,6 +75,7 @@ class ExecutionService internal constructor(
         scheduler = Schedulers.parallel(),
         requestTimeout = requestTimeout,
         reconciliationInterval = reconciliationInterval,
+        stopConfirmationTimeout = stopConfirmationTimeout,
     )
 
     private val pendingOrders = ConcurrentHashMap<String, PendingOrder>()
@@ -89,6 +95,12 @@ class ExecutionService internal constructor(
         ) {
             "reconciliationInterval must be positive"
         }
+        require(
+            !stopConfirmationTimeout.isZero &&
+                !stopConfirmationTimeout.isNegative,
+        ) {
+            "stopConfirmationTimeout must be positive"
+        }
         subscriptions.add(
             privateEvents.subscribe(
                 ::routePrivateEvent,
@@ -97,9 +109,51 @@ class ExecutionService internal constructor(
         )
     }
 
-    fun execute(request: OrderIntentRequest): Mono<OrderResolution> {
+    override fun execute(request: OrderIntentRequest): Mono<OrderResolution> {
         val intent = clientOrderIdFactory.create(request)
         return dispatch(intent, closeOnUnknown = true).cache()
+    }
+
+    override fun confirmHardStop(
+        request: OrderIntentRequest,
+    ): Mono<HardStopConfirmation> {
+        val intent = clientOrderIdFactory.create(request)
+        return Mono.defer {
+            val confirmedPositionAmount = checkNotNull(
+                intent.confirmedPositionAmount,
+            )
+            symbolCoordinator
+                .recordOwnership(
+                    levelId = intent.levelId,
+                    ownsActiveAttempt = true,
+                    ownsExposure = true,
+                    hasUnresolvedOrder = true,
+                )
+                .then(
+                    symbolCoordinator.submit(
+                        symbol = intent.symbol,
+                        eventId = "hard-stop-intent:${intent.clientOrderId}",
+                    ) {
+                        recordIntent(intent)
+                    },
+                )
+                .then(placeAndConfirmHardStop(intent))
+                .onErrorResume {
+                    Mono.just(
+                        failedHardStopConfirmation(
+                            intent = intent,
+                            reconciliationChecks = 0,
+                        ),
+                    )
+                }
+                .flatMap { confirmation ->
+                    finalizeHardStopConfirmation(
+                        confirmation.copy(
+                            confirmedPositionAmount = confirmedPositionAmount,
+                        ),
+                    )
+                }
+        }.cache()
     }
 
     fun currentState(): ExecutionSnapshot =
@@ -171,15 +225,229 @@ class ExecutionService internal constructor(
         check(pendingOrders.putIfAbsent(pending.intent.clientOrderId, pending) == null) {
             "Duplicate clientOrderId ${pending.intent.clientOrderId}"
         }
-        activeSymbols += pending.intent.symbol
-        orders[pending.intent.clientOrderId] =
-            pending.intent.snapshot(clock.instant())
+        recordIntent(pending.intent)
+    }
+
+    private fun recordIntent(intent: OrderIntent) {
+        check(!orders.containsKey(intent.clientOrderId)) {
+            "Duplicate clientOrderId ${intent.clientOrderId}"
+        }
+        activeSymbols += intent.symbol
+        orders[intent.clientOrderId] = intent.snapshot(clock.instant())
         evidenceRecorder.recordOrderIntent(
-            levelId = pending.intent.levelId,
-            symbol = pending.intent.symbol,
+            levelId = intent.levelId,
+            symbol = intent.symbol,
             timestamp = clock.instant(),
-            order = pending.intent.evidence(),
+            order = intent.evidence(),
         )
+    }
+
+    private fun placeAndConfirmHardStop(
+        intent: OrderIntent,
+    ): Mono<HardStopConfirmation> {
+        val checks = AtomicInteger()
+        val lastObservation =
+            AtomicReference<HardStopConfirmation?>()
+        val placement = client
+            .placeOrder(intent.toBinanceRequest())
+            .timeout(requestTimeout, scheduler)
+            .onErrorResume { Mono.empty() }
+            .then()
+        return placement
+            .then(reconcileHardStop(intent, checks, lastObservation))
+            .timeout(stopConfirmationTimeout, scheduler)
+            .onErrorResume {
+                Mono.just(
+                    lastObservation.get()?.copy(confirmed = false)
+                        ?: failedHardStopConfirmation(
+                            intent = intent,
+                            reconciliationChecks = checks.get(),
+                        ),
+                )
+            }
+    }
+
+    private fun reconcileHardStop(
+        intent: OrderIntent,
+        checks: AtomicInteger,
+        lastObservation: AtomicReference<HardStopConfirmation?>,
+    ): Mono<HardStopConfirmation> {
+        val interval = minOf(reconciliationInterval, MAX_STOP_CHECK_INTERVAL)
+        val maximumChecks = (
+            stopConfirmationTimeout.toMillis() /
+                interval.toMillis().coerceAtLeast(1L) +
+                1L
+            ).coerceAtMost(MAX_STOP_RECONCILIATION_CHECKS.toLong()).toInt()
+        return Flux
+            .range(1, maximumChecks)
+            .concatMap { attempt ->
+                val delay = if (attempt == 1) Duration.ZERO else interval
+                Mono
+                    .delay(delay, scheduler)
+                    .then(
+                        client.reconcileOrder(
+                            symbol = intent.symbol,
+                            clientOrderId = intent.clientOrderId,
+                        ),
+                    )
+                    .onErrorResume { error ->
+                        Mono.just(
+                            BinanceOrderReconciliation(
+                                order = null,
+                                position = null,
+                                openClientOrderIds = emptySet(),
+                                safeDetail = error.javaClass.simpleName,
+                            ),
+                        )
+                    }
+                    .flatMap { reconciliation ->
+                        checks.set(attempt)
+                        val evaluation = evaluateHardStop(
+                            intent = intent,
+                            attempt = attempt,
+                            reconciliation = reconciliation,
+                        )
+                        lastObservation.set(evaluation.confirmation)
+                        symbolCoordinator
+                            .submit(
+                                symbol = intent.symbol,
+                                eventId =
+                                    "hard-stop-reconciliation:${intent.clientOrderId}:$attempt",
+                            ) {
+                                recordHardStopReconciliation(
+                                    intent = intent,
+                                    attempt = attempt,
+                                    reconciliation = reconciliation,
+                                    evaluation = evaluation,
+                                )
+                            }
+                            .thenReturn(evaluation)
+                    }
+            }
+            .filter(HardStopEvaluation::terminal)
+            .next()
+            .map(HardStopEvaluation::confirmation)
+            .switchIfEmpty(Mono.never())
+    }
+
+    private fun evaluateHardStop(
+        intent: OrderIntent,
+        attempt: Int,
+        reconciliation: BinanceOrderReconciliation,
+    ): HardStopEvaluation {
+        val order = reconciliation.order
+        val observedWorkingType = order?.workingType?.let { value ->
+            runCatching { TriggerWorkingType.valueOf(value.uppercase()) }
+                .getOrNull()
+        }
+        val confirmed =
+            order != null &&
+                order.status.equals("NEW", ignoreCase = true) &&
+                order.clientOrderId in reconciliation.openClientOrderIds &&
+                order.type.equals(OrderType.STOP_MARKET.name, ignoreCase = true) &&
+                order.closePosition &&
+                order.stopPrice?.compareTo(checkNotNull(intent.stopPrice)) == 0 &&
+                observedWorkingType == intent.workingType &&
+                order.priceProtect == intent.priceProtect
+        val definitivelyFailed = order?.status?.uppercase() in STOP_TERMINAL_STATUSES
+        return HardStopEvaluation(
+            terminal = confirmed || definitivelyFailed,
+            confirmation = HardStopConfirmation(
+                intent = intent,
+                confirmed = confirmed,
+                exchangeOrderId = order?.orderId,
+                observedStopPrice = order?.stopPrice,
+                observedWorkingType = observedWorkingType,
+                observedPriceProtect = order?.priceProtect,
+                reconciliationChecks = attempt,
+                confirmedPositionAmount =
+                    reconciliation.position?.positionAmount
+                        ?: checkNotNull(intent.confirmedPositionAmount),
+            ),
+        )
+    }
+
+    private fun recordHardStopReconciliation(
+        intent: OrderIntent,
+        attempt: Int,
+        reconciliation: BinanceOrderReconciliation,
+        evaluation: HardStopEvaluation,
+    ) {
+        reconciliation.position?.let { position ->
+            positions[intent.symbol] = ExecutionPositionSnapshot(
+                symbol = intent.symbol,
+                positionAmount = position.positionAmount,
+                entryPrice = position.entryPrice,
+                updatedAt = clock.instant(),
+            )
+        }
+        val result = when {
+            evaluation.confirmation.confirmed -> OrderOutcome.ACTIVE.name
+            evaluation.terminal -> ExecutionReasonCode.STOP_SETUP_FAILED.name
+            else -> OrderOutcome.UNKNOWN.name
+        }
+        evidenceRecorder.recordReconciliation(
+            levelId = intent.levelId,
+            symbol = intent.symbol,
+            timestamp = clock.instant(),
+            reconciliation = ReconciliationEvidence(
+                clientOrderId = intent.clientOrderId,
+                attemptNumber = attempt,
+                result = result,
+                exchangeOrderId = reconciliation.order?.orderId,
+                requestedQuantity = null,
+                filledQuantity = reconciliation.order?.executedQuantity,
+                safeDetail = reconciliation.safeDetail,
+            ),
+        )
+    }
+
+    private fun failedHardStopConfirmation(
+        intent: OrderIntent,
+        reconciliationChecks: Int,
+    ): HardStopConfirmation =
+        HardStopConfirmation(
+            intent = intent,
+            confirmed = false,
+            exchangeOrderId = null,
+            observedStopPrice = null,
+            observedWorkingType = null,
+            observedPriceProtect = null,
+            reconciliationChecks = reconciliationChecks,
+            confirmedPositionAmount =
+                checkNotNull(intent.confirmedPositionAmount),
+        )
+
+    private fun finalizeHardStopConfirmation(
+        confirmation: HardStopConfirmation,
+    ): Mono<HardStopConfirmation> {
+        val intent = confirmation.intent
+        orders.computeIfPresent(intent.clientOrderId) { _, current ->
+            current.copy(
+                outcome = if (confirmation.confirmed) {
+                    OrderOutcome.ACTIVE
+                } else {
+                    OrderOutcome.UNKNOWN
+                },
+                source = OrderResolutionSource.REST_RECONCILIATION,
+                exchangeOrderId = confirmation.exchangeOrderId,
+                updatedAt = clock.instant(),
+                reason = if (confirmation.confirmed) {
+                    null
+                } else {
+                    ExecutionReasonCode.STOP_SETUP_FAILED
+                },
+            )
+        }
+        val exposure = confirmation.confirmedPositionAmount.signum() != 0
+        return symbolCoordinator
+            .recordOwnership(
+                levelId = intent.levelId,
+                ownsActiveAttempt = true,
+                ownsExposure = exposure,
+                hasUnresolvedOrder = !confirmation.confirmed,
+            )
+            .thenReturn(confirmation)
     }
 
     private fun resolvePlacedOrder(
@@ -624,6 +892,8 @@ class ExecutionService internal constructor(
             quantity = confirmedQuantity,
             price = price,
             stopPrice = stopPrice,
+            workingType = workingType?.name,
+            priceProtect = priceProtect,
             reduceOnly = reduceOnly,
             closePosition = closePosition,
         )
@@ -638,6 +908,9 @@ class ExecutionService internal constructor(
             role = role,
             slot = slot,
             requestedQuantity = confirmedQuantity,
+            stopPrice = stopPrice,
+            workingType = workingType,
+            priceProtect = priceProtect,
             actualFilledQuantity = BigDecimal.ZERO,
             outcome = null,
             source = null,
@@ -664,6 +937,9 @@ class ExecutionService internal constructor(
             filledQuantity = filledQuantity,
             averageFilledPrice = null,
             stopPrice = stopPrice,
+            workingType = workingType?.name,
+            priceProtect = priceProtect,
+            closePosition = closePosition,
             status = status,
             reduceOnly = reduceOnly,
         )
@@ -674,4 +950,19 @@ private data class PendingOrder(
     val result: Sinks.One<OrderResolution> = Sinks.one(),
 )
 
+private data class HardStopEvaluation(
+    val terminal: Boolean,
+    val confirmation: HardStopConfirmation,
+)
+
 private const val MAX_RECONCILIATION_CHECKS = 3
+private const val MAX_STOP_RECONCILIATION_CHECKS = 50
+private val MAX_STOP_CHECK_INTERVAL: Duration = Duration.ofMillis(250)
+private val STOP_TERMINAL_STATUSES = setOf(
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "EXPIRED_IN_MATCH",
+    "FILLED",
+    "REJECTED",
+)

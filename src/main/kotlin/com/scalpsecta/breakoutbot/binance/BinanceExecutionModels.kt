@@ -22,6 +22,8 @@ data class BinanceOrderRequest(
     val quantity: BigDecimal? = null,
     val price: BigDecimal? = null,
     val stopPrice: BigDecimal? = null,
+    val workingType: String? = null,
+    val priceProtect: Boolean? = null,
     val reduceOnly: Boolean = false,
     val closePosition: Boolean = false,
 )
@@ -44,6 +46,10 @@ data class BinanceOrderStatus(
     val reduceOnly: Boolean,
     val closePosition: Boolean,
     val updatedAt: Instant,
+    val type: String? = null,
+    val stopPrice: BigDecimal? = null,
+    val workingType: String? = null,
+    val priceProtect: Boolean? = null,
 )
 
 data class BinancePositionRisk(

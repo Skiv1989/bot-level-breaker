@@ -136,6 +136,8 @@ sealed interface BinanceUserDataEvent {
         val realizedProfit: BigDecimal,
         val positionSide: String,
         val reduceOnly: Boolean,
+        val workingType: String? = null,
+        val priceProtect: Boolean? = null,
     ) : BinanceUserDataEvent
 
     data class ListenKeyExpired(

@@ -170,6 +170,73 @@ class ExecutionServiceTest {
     }
 
     @Test
+    fun `hard stop confirms only as one exact active exchange-side trigger`() {
+        val harness = harness()
+        harness.client.onReconcile = { _, clientOrderId ->
+            Mono.just(
+                activeHardStopReconciliation(
+                    clientOrderId = clientOrderId,
+                    stopPrice = BigDecimal("99.7"),
+                    workingType = "CONTRACT_PRICE",
+                    priceProtect = false,
+                ),
+            )
+        }
+
+        val confirmation = harness.service
+            .confirmHardStop(hardStopRequest())
+            .block(TIMEOUT)!!
+
+        assertThat(confirmation.confirmed).isTrue()
+        assertThat(confirmation.observedStopPrice)
+            .isEqualByComparingTo("99.7")
+        assertThat(confirmation.observedWorkingType)
+            .isEqualTo(TriggerWorkingType.CONTRACT_PRICE)
+        assertThat(confirmation.observedPriceProtect).isFalse()
+        assertThat(confirmation.reconciliationChecks).isEqualTo(1)
+        assertThat(harness.client.placements).hasSize(1)
+        val placement = harness.client.placements.single()
+        assertThat(placement.type).isEqualTo("STOP_MARKET")
+        assertThat(placement.quantity).isNull()
+        assertThat(placement.closePosition).isTrue()
+        assertThat(placement.workingType).isEqualTo("CONTRACT_PRICE")
+        assertThat(placement.priceProtect).isFalse()
+        assertThat(harness.service.currentState().orders.single().outcome)
+            .isEqualTo(OrderOutcome.ACTIVE)
+        assertThat(harness.service.currentState().entriesAndAdditionsBlocked)
+            .isFalse()
+    }
+
+    @Test
+    fun `hard stop rejects a mismatched exchange trigger within the deadline`() {
+        val harness = harness()
+        harness.client.onReconcile = { _, clientOrderId ->
+            Mono.just(
+                activeHardStopReconciliation(
+                    clientOrderId = clientOrderId,
+                    stopPrice = BigDecimal("99.6"),
+                    workingType = "MARK_PRICE",
+                    priceProtect = true,
+                ),
+            )
+        }
+
+        val confirmation = harness.service
+            .confirmHardStop(hardStopRequest())
+            .block(TIMEOUT)!!
+
+        assertThat(confirmation.confirmed).isFalse()
+        assertThat(confirmation.reconciliationChecks).isGreaterThan(0)
+        assertThat(harness.client.placements).hasSize(1)
+        assertThat(harness.service.currentState().orders.single().outcome)
+            .isEqualTo(OrderOutcome.UNKNOWN)
+        assertThat(harness.service.currentState().orders.single().reason)
+            .isEqualTo(ExecutionReasonCode.STOP_SETUP_FAILED)
+        assertThat(harness.service.currentState().entriesAndAdditionsBlocked)
+            .isTrue()
+    }
+
+    @Test
     fun `REST reconciliation classifies every resolved terminal outcome`() {
         val harness = harness()
         val cases = listOf(
@@ -342,6 +409,7 @@ class ExecutionServiceTest {
             scheduler = executionScheduler,
             requestTimeout = Duration.ofMillis(10),
             reconciliationInterval = Duration.ofMillis(10),
+            stopConfirmationTimeout = Duration.ofMillis(100),
         )
         resources += AutoCloseable {
             service.close()
@@ -387,6 +455,53 @@ class ExecutionServiceTest {
             confirmedQuantity = confirmedQuantity,
             reduceOnly = reduceOnly,
             confirmedPositionAmount = BigDecimal("0.30"),
+        )
+
+    private fun hardStopRequest(): OrderIntentRequest =
+        OrderIntentRequest(
+            levelId = LEVEL_ID,
+            attemptNumber = 1,
+            symbol = SYMBOL,
+            role = OrderRole.HARD_STOP,
+            slot = 0,
+            side = OrderSide.SELL,
+            type = OrderType.STOP_MARKET,
+            stopPrice = BigDecimal("99.7"),
+            workingType = TriggerWorkingType.CONTRACT_PRICE,
+            priceProtect = false,
+            closePosition = true,
+            confirmedPositionAmount = BigDecimal("0.30"),
+        )
+
+    private fun activeHardStopReconciliation(
+        clientOrderId: String,
+        stopPrice: BigDecimal,
+        workingType: String,
+        priceProtect: Boolean,
+    ): BinanceOrderReconciliation =
+        BinanceOrderReconciliation(
+            order = BinanceOrderStatus(
+                symbol = SYMBOL,
+                clientOrderId = clientOrderId,
+                orderId = 1002L,
+                status = "NEW",
+                originalQuantity = BigDecimal.ZERO,
+                executedQuantity = BigDecimal.ZERO,
+                averagePrice = BigDecimal.ZERO,
+                reduceOnly = false,
+                closePosition = true,
+                updatedAt = EVENT_AT,
+                type = "STOP_MARKET",
+                stopPrice = stopPrice,
+                workingType = workingType,
+                priceProtect = priceProtect,
+            ),
+            position = BinancePositionRisk(
+                symbol = SYMBOL,
+                positionAmount = BigDecimal("0.30"),
+                entryPrice = BigDecimal("100.0"),
+            ),
+            openClientOrderIds = setOf(clientOrderId),
         )
 
     private fun orderUpdate(

@@ -89,6 +89,8 @@ class BinanceUserDataEventParser(
             realizedProfit = order.requiredDecimal("rp"),
             positionSide = order.requiredText("ps"),
             reduceOnly = order.requiredBoolean("R"),
+            workingType = order.optionalText("wt"),
+            priceProtect = order.optionalBoolean("pP"),
         )
     }
 }
@@ -115,6 +117,9 @@ private fun JsonNode.requiredLong(name: String): Long =
 
 private fun JsonNode.requiredBoolean(name: String): Boolean =
     required(name).asBoolean()
+
+private fun JsonNode.optionalBoolean(name: String): Boolean? =
+    get(name)?.takeUnless(JsonNode::isNull)?.asBoolean()
 
 private fun JsonNode.requiredDecimal(name: String): BigDecimal =
     required(name).asText().toBigDecimal()
