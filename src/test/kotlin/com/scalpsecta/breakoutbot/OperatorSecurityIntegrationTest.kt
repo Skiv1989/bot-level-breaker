@@ -137,6 +137,10 @@ class OperatorSecurityIntegrationTest {
                 .isEqualByComparingTo(BigDecimal.ZERO)
             assertThat(snapshot["risk"]["attempts"]).isEmpty()
             assertThat(snapshot["risk"]["reservations"]).isEmpty()
+            assertThat(snapshot["evidence"]["persistentFilesAuthoritative"].asBoolean())
+                .isTrue()
+            assertThat(snapshot["evidence"]["recentAudit"]).isEmpty()
+            assertThat(snapshot["evidence"]["recentTrades"]).isEmpty()
             assertThat(response.body()).doesNotContainCredentials()
         }
     }

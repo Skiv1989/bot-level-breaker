@@ -7,6 +7,8 @@ import com.scalpsecta.breakoutbot.binance.BinanceMarginType
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.domain.BinanceReadiness
+import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
+import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
 import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
 import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
@@ -40,17 +42,20 @@ class LevelService internal constructor(
     private val publicMarketDataService: PublicMarketDataService,
     private val clock: Clock,
     private val automaticTimers: Boolean,
+    private val evidenceRecorder: EvidenceRecorder = NoOpEvidenceRecorder,
 ) {
     @Autowired
     constructor(
         client: AuthenticatedBinanceClient,
         publicMarketDataService: PublicMarketDataService,
         clock: Clock,
+        evidenceRecorder: EvidenceRecorder,
     ) : this(
         client = client,
         publicMarketDataService = publicMarketDataService,
         clock = clock,
         automaticTimers = true,
+        evidenceRecorder = evidenceRecorder,
     )
 
     private val lock = ReentrantLock()
@@ -253,7 +258,9 @@ class LevelService internal constructor(
                 is SymbolLevelEvent.DeleteLevel -> deleteLevel(event)
                 is SymbolLevelEvent.UpdateOwnership -> updateOwnership(event)
                 is SymbolLevelEvent.AggregateTrade -> {
+                    evidenceRecorder.record(event.event)
                     levelsForSymbol(symbol).forEach { stored ->
+                        val before = stored.snapshot
                         stored.signalTracker.record(event.event)
                         if (
                             stored.snapshot.state == LevelState.WARMING_UP &&
@@ -274,15 +281,22 @@ class LevelService internal constructor(
                             )
                         }
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
+                        recordStateTransition(
+                            before = before,
+                            after = stored.snapshot,
+                            publicMarketData = event.publicMarketData,
+                        )
                     }
                     Unit
                 }
 
                 is SymbolLevelEvent.BookTicker -> {
+                    evidenceRecorder.record(event.event)
                     val referencePrice = event.event.bidPrice
                         .add(event.event.askPrice)
                         .divide(TWO, CALCULATION_SCALE, RoundingMode.HALF_UP)
                     levelsForSymbol(symbol).forEach { stored ->
+                        val before = stored.snapshot
                         stored.signalTracker.record(event.event)
                         advanceWarmup(
                             stored = stored,
@@ -296,12 +310,19 @@ class LevelService internal constructor(
                             publicMarketData = event.publicMarketData,
                         )
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
+                        recordStateTransition(
+                            before = before,
+                            after = stored.snapshot,
+                            publicMarketData = event.publicMarketData,
+                        )
                     }
                     Unit
                 }
 
                 is SymbolLevelEvent.Timer -> {
+                    evidenceRecorder.advance(event.processedAt)
                     levelsForSymbol(symbol).forEach { stored ->
+                        val before = stored.snapshot
                         stored.signalTracker.tick(event.processedAt, stored.npuMode)
                         advanceWarmup(
                             stored = stored,
@@ -323,6 +344,11 @@ class LevelService internal constructor(
                             )
                         }
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
+                        recordStateTransition(
+                            before = before,
+                            after = stored.snapshot,
+                            publicMarketData = event.publicMarketData,
+                        )
                     }
                     Unit
                 }
@@ -390,7 +416,10 @@ class LevelService internal constructor(
             privateStreamReadiness = BinanceReadiness.NOT_READY,
             globalState = GlobalTradingState.RUNNING,
             now = event.processedAt,
-        ).also { stored.snapshot = it }
+        ).also {
+            stored.snapshot = it
+            evidenceRecorder.recordLevelCreated(it, event.publicMarketData)
+        }
     }
 
     private fun deleteLevel(event: SymbolLevelEvent.DeleteLevel): LevelSnapshot {
@@ -412,13 +441,22 @@ class LevelService internal constructor(
         checkNotNull(levels.remove(event.levelId)) {
             "Level ${event.levelId} disappeared from its ordered event queue"
         }
-        return currentSnapshot(
+        val deleted = currentSnapshot(
             stored = stored,
             publicMarketData = event.publicMarketData,
             privateStreamReadiness = BinanceReadiness.NOT_READY,
             globalState = GlobalTradingState.RUNNING,
             now = event.processedAt,
         )
+        evidenceRecorder.recordLevelDeleted(
+            level = deleted,
+            marketData = event.publicMarketData,
+            deletedAt = event.processedAt,
+        )
+        if (levels.values.none { candidate -> candidate.snapshot.symbol == deleted.symbol }) {
+            evidenceRecorder.discardRollingBuffer(deleted.symbol)
+        }
+        return deleted
     }
 
     private fun updateOwnership(
@@ -443,6 +481,7 @@ class LevelService internal constructor(
                 "Level ${otherOwner.snapshot.id} already owns the active attempt for ${stored.snapshot.symbol}",
             )
         }
+        val before = stored.snapshot
         stored.snapshot = stored.snapshot.copy(
             ownsActiveAttempt = event.ownsActiveAttempt,
             ownsExposure = event.ownsExposure,
@@ -455,7 +494,15 @@ class LevelService internal constructor(
             privateStreamReadiness = BinanceReadiness.NOT_READY,
             globalState = GlobalTradingState.RUNNING,
             now = event.processedAt,
-        ).also { stored.snapshot = it }
+        ).also {
+            stored.snapshot = it
+            evidenceRecorder.recordOwnershipChange(
+                before = before,
+                after = it,
+                marketData = event.publicMarketData,
+                changedAt = event.processedAt,
+            )
+        }
     }
 
     private fun advanceWarmup(
@@ -543,6 +590,30 @@ class LevelService internal constructor(
             privateStreamReadiness = BinanceReadiness.NOT_READY,
             globalState = GlobalTradingState.RUNNING,
             now = now,
+        )
+    }
+
+    private fun recordStateTransition(
+        before: LevelSnapshot,
+        after: LevelSnapshot,
+        publicMarketData: PublicMarketDataSnapshot?,
+    ) {
+        if (before.state == after.state) {
+            return
+        }
+        val decision = when (after.state) {
+            LevelState.ARMED -> "WARMUP_COMPLETE"
+            LevelState.APPROACH -> "ACTIVATION_BAND_ENTERED"
+            LevelState.TERMINAL ->
+                after.terminalReason?.name ?: "ATTEMPT_TERMINAL"
+
+            LevelState.WARMING_UP -> "WARMUP_STARTED"
+        }
+        evidenceRecorder.recordStateTransition(
+            before = before,
+            after = after,
+            marketData = publicMarketData,
+            decision = decision,
         )
     }
 

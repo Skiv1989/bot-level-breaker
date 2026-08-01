@@ -1,6 +1,15 @@
 package com.scalpsecta.breakoutbot.risk
 
+import com.scalpsecta.breakoutbot.evidence.AuditEventType
+import com.scalpsecta.breakoutbot.evidence.AuditRecordDraft
+import com.scalpsecta.breakoutbot.evidence.DecisionEvidence
+import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
+import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
+import com.scalpsecta.breakoutbot.evidence.PriceEvidence
+import com.scalpsecta.breakoutbot.evidence.QuantityEvidence
+import com.scalpsecta.breakoutbot.evidence.RiskEvidence
 import com.scalpsecta.breakoutbot.level.LevelDirection
+import com.scalpsecta.breakoutbot.level.LevelState
 import jakarta.annotation.PreDestroy
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
@@ -20,11 +29,16 @@ import kotlin.math.min
 class AttemptRiskService internal constructor(
     private val clock: Clock,
     private val scheduler: Scheduler,
+    private val evidenceRecorder: EvidenceRecorder = NoOpEvidenceRecorder,
 ) {
     @Autowired
-    constructor(clock: Clock) : this(
+    constructor(
+        clock: Clock,
+        evidenceRecorder: EvidenceRecorder,
+    ) : this(
         clock = clock,
         scheduler = Schedulers.newSingle("global-risk-events"),
+        evidenceRecorder = evidenceRecorder,
     )
 
     private val attempts = linkedMapOf<UUID, MutableRiskAttempt>()
@@ -117,12 +131,54 @@ class AttemptRiskService internal constructor(
             )
         }
         val state = publishState()
-        return AttemptAdmissionDecision(
+        val decision = AttemptAdmissionDecision(
             admitted = blockers.isEmpty(),
             blockers = blockers,
             plan = plan,
             state = state,
         )
+        evidenceRecorder.recordAudit(
+            AuditRecordDraft(
+                timestamp = event.admittedAt,
+                symbol = event.request.symbol.normalizedSymbol(),
+                levelId = event.request.levelId,
+                stateBefore = LevelState.APPROACH,
+                stateAfter = LevelState.APPROACH,
+                eventType = AuditEventType.DECISION,
+                decision = if (decision.admitted) {
+                    "ATTEMPT_ADMITTED"
+                } else {
+                    "ATTEMPT_BLOCKED"
+                },
+                blockerReasons = blockers.map(Enum<*>::name),
+                evidence = DecisionEvidence(
+                    prices = PriceEvidence(
+                        levelPrice = event.request.levelPrice,
+                        bidPrice = event.request.bestBidPrice,
+                        askPrice = event.request.bestAskPrice,
+                        spread = event.request.bestAskPrice
+                            .subtract(event.request.bestBidPrice),
+                        npu = event.request.frozenNpu,
+                        stopPrice = plan.structuralStopPrice,
+                        takeProfitPrices = plan.takeProfits.map { takeProfit ->
+                            takeProfit.price
+                        },
+                    ),
+                    quantity = QuantityEvidence(
+                        plannedQuantity = event.request.plannedQuantity,
+                    ),
+                    risk = RiskEvidence(
+                        plan = plan,
+                        reservedRisk = if (decision.admitted) {
+                            plan.levelRiskBudget
+                        } else {
+                            BigDecimal.ZERO
+                        },
+                    ),
+                ),
+            ),
+        )
+        return decision
     }
 
     private fun confirmExposure(
@@ -139,7 +195,31 @@ class AttemptRiskService internal constructor(
         attempt.status = RiskAttemptStatus.OPEN_POSITION
         attempt.confirmedPositionQuantity = event.confirmedPositionQuantity
         reservation.status = RiskReservationStatus.OPEN_POSITION
-        return publishState()
+        return publishState().also {
+            evidenceRecorder.recordAudit(
+                AuditRecordDraft(
+                    timestamp = clock.instant(),
+                    symbol = attempt.symbol,
+                    levelId = attempt.levelId,
+                    stateBefore = LevelState.APPROACH,
+                    stateAfter = LevelState.APPROACH,
+                    eventType = AuditEventType.RISK_UPDATED,
+                    decision = "EXPOSURE_CONFIRMED",
+                    evidence = DecisionEvidence(
+                        quantity = QuantityEvidence(
+                            plannedQuantity = reservation.plannedQuantity,
+                            filledQuantity = event.confirmedPositionQuantity,
+                            remainingQuantity = event.confirmedPositionQuantity,
+                        ),
+                        risk = RiskEvidence(
+                            plan = attempt.plan,
+                            reservedRisk = reservation.reservedRisk,
+                            remainingReservedRisk = reservation.reservedRisk,
+                        ),
+                    ),
+                ),
+            )
+        }
     }
 
     private fun confirmReducingFill(
@@ -156,21 +236,74 @@ class AttemptRiskService internal constructor(
         require(event.confirmedRemainingQuantity < attempt.confirmedPositionQuantity) {
             "confirmedRemainingQuantity must reflect a reducing fill"
         }
+        val previousReservedRisk = reservation.reservedRisk
         attempt.confirmedPositionQuantity = event.confirmedRemainingQuantity
         reservation.reservedRisk = reservation.levelRiskBudget
             .multiply(event.confirmedRemainingQuantity)
             .divide(reservation.plannedQuantity, MATH_CONTEXT)
-        return publishState()
+        return publishState().also {
+            evidenceRecorder.recordAudit(
+                AuditRecordDraft(
+                    timestamp = clock.instant(),
+                    symbol = attempt.symbol,
+                    levelId = attempt.levelId,
+                    stateBefore = LevelState.APPROACH,
+                    stateAfter = LevelState.APPROACH,
+                    eventType = AuditEventType.RISK_UPDATED,
+                    decision = "RESERVATION_REDUCED",
+                    evidence = DecisionEvidence(
+                        quantity = QuantityEvidence(
+                            plannedQuantity = reservation.plannedQuantity,
+                            remainingQuantity = event.confirmedRemainingQuantity,
+                        ),
+                        risk = RiskEvidence(
+                            plan = attempt.plan,
+                            releasedRisk = previousReservedRisk
+                                .subtract(reservation.reservedRisk),
+                            remainingReservedRisk = reservation.reservedRisk,
+                        ),
+                    ),
+                ),
+            )
+        }
     }
 
     private fun confirmFlat(event: RiskEvent.ConfirmedFlat): GlobalRiskSnapshot {
         val attempt = activeAttempt(event.levelId)
-        activeReservation(event.levelId)
+        val reservation = activeReservation(event.levelId)
         reservations.remove(event.levelId)
         attempt.status = RiskAttemptStatus.FLAT_CONFIRMED
         attempt.confirmedPositionQuantity = BigDecimal.ZERO
         attempt.completedAt = event.confirmedAt
-        return publishState()
+        return publishState().also {
+            evidenceRecorder.recordAudit(
+                AuditRecordDraft(
+                    timestamp = event.confirmedAt,
+                    symbol = attempt.symbol,
+                    levelId = attempt.levelId,
+                    stateBefore = LevelState.APPROACH,
+                    stateAfter = LevelState.APPROACH,
+                    eventType = AuditEventType.RISK_UPDATED,
+                    decision = "FLAT_CONFIRMED",
+                    evidence = DecisionEvidence(
+                        quantity = QuantityEvidence(
+                            plannedQuantity = reservation.plannedQuantity,
+                            remainingQuantity = BigDecimal.ZERO,
+                        ),
+                        risk = RiskEvidence(
+                            plan = attempt.plan,
+                            releasedRisk = reservation.reservedRisk,
+                            remainingReservedRisk = BigDecimal.ZERO,
+                        ),
+                    ),
+                ),
+            )
+            evidenceRecorder.completeAttempt(
+                levelId = attempt.levelId,
+                symbol = attempt.symbol,
+                completedAt = event.confirmedAt,
+            )
+        }
     }
 
     private fun blockers(

@@ -14,10 +14,13 @@ import com.scalpsecta.breakoutbot.binance.BinancePriceFilter
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolConfiguration
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
+import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
+import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
 import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
 import com.scalpsecta.breakoutbot.marketdata.AggressorSide
 import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
+import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataStreamProvider
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowableOfType
@@ -41,11 +44,13 @@ class LevelServiceTest {
         streamProvider = EmptyMarketDataStreamProvider,
         clock = clock,
     )
+    private val evidenceRecorder = RecordingEvidenceRecorder()
     private val service = LevelService(
         client = client,
         publicMarketDataService = marketDataService,
         clock = clock,
         automaticTimers = false,
+        evidenceRecorder = evidenceRecorder,
     )
 
     @AfterEach
@@ -291,6 +296,19 @@ class LevelServiceTest {
         assertThat(approach.signal.npu.absolute)
             .isEqualByComparingTo(BigDecimal("0.1"))
         assertThat(approach.signal.npu.frozen).isTrue()
+        assertThat(evidenceRecorder.transitions)
+            .containsExactly(
+                RecordedTransition(
+                    before = LevelState.WARMING_UP,
+                    after = LevelState.ARMED,
+                    decision = "WARMUP_COMPLETE",
+                ),
+                RecordedTransition(
+                    before = LevelState.ARMED,
+                    after = LevelState.APPROACH,
+                    decision = "ACTIVATION_BAND_ENTERED",
+                ),
+            )
     }
 
     @Test
@@ -503,6 +521,25 @@ class LevelServiceTest {
     private fun levelFailure(block: () -> Unit): LevelException =
         catchThrowableOfType(block, LevelException::class.java)
 }
+
+private class RecordingEvidenceRecorder : EvidenceRecorder by NoOpEvidenceRecorder {
+    val transitions = mutableListOf<RecordedTransition>()
+
+    override fun recordStateTransition(
+        before: LevelSnapshot,
+        after: LevelSnapshot,
+        marketData: PublicMarketDataSnapshot?,
+        decision: String,
+    ) {
+        transitions += RecordedTransition(before.state, after.state, decision)
+    }
+}
+
+private data class RecordedTransition(
+    val before: LevelState,
+    val after: LevelState,
+    val decision: String,
+)
 
 private object EmptyMarketDataStreamProvider : PublicMarketDataStreamProvider {
     override fun aggregateTrades(symbol: String): Flux<AggregateTradeEvent> =

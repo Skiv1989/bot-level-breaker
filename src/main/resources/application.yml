@@ -16,6 +16,12 @@ server:
 bot:
   binance:
     startup-enabled: true
+  evidence:
+    directory: "${BOT_EVIDENCE_DIRECTORY:build/evidence}"
+    recent-audit-limit: 200
+    recent-trade-limit: 200
+    raw-event-limit: 100000
+    shutdown-flush-timeout: 2s
   security:
     username: "${BOT_BASIC_USERNAME}"
     password: "${BOT_BASIC_PASSWORD}"
