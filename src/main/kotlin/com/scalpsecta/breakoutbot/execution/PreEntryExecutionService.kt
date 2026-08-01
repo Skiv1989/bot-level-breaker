@@ -17,6 +17,8 @@ import org.springframework.stereotype.Service
 import reactor.core.Disposable
 import reactor.core.publisher.Mono
 import java.math.BigDecimal
+import java.time.Clock
+import java.time.Instant
 
 @Service
 class PreEntryExecutionService internal constructor(
@@ -25,6 +27,7 @@ class PreEntryExecutionService internal constructor(
     private val riskService: AttemptRiskService,
     private val orderExecutor: PreEntryOrderExecutor,
     automaticDispatch: Boolean,
+    private val clock: Clock = Clock.systemUTC(),
 ) {
     @Autowired
     constructor(
@@ -32,12 +35,14 @@ class PreEntryExecutionService internal constructor(
         riskContextProvider: PreEntryRiskContextProvider,
         riskService: AttemptRiskService,
         orderExecutor: PreEntryOrderExecutor,
+        clock: Clock,
     ) : this(
         levelCoordinator = levelCoordinator,
         riskContextProvider = riskContextProvider,
         riskService = riskService,
         orderExecutor = orderExecutor,
         automaticDispatch = true,
+        clock = clock,
     )
 
     private val automaticSubscription: Disposable? = if (automaticDispatch) {
@@ -128,6 +133,7 @@ class PreEntryExecutionService internal constructor(
         structuralStopPrice: BigDecimal,
         resolution: OrderResolution,
     ): Mono<PreEntryResult> {
+        val preEntryFilledAt = clock.instant()
         val confirmedPositionAmount = resolution.confirmedPositionAmount
         val confirmedQuantity = confirmedPositionAmount.abs()
         val recordExposure = if (confirmedQuantity.signum() > 0) {
@@ -194,6 +200,7 @@ class PreEntryExecutionService internal constructor(
                         resolution = resolution,
                         structuralStopPrice = structuralStopPrice,
                         confirmedPositionAmount = confirmedPositionAmount,
+                        preEntryFilledAt = preEntryFilledAt,
                     )
                 }
             },
@@ -205,6 +212,7 @@ class PreEntryExecutionService internal constructor(
         resolution: OrderResolution,
         structuralStopPrice: BigDecimal,
         confirmedPositionAmount: BigDecimal,
+        preEntryFilledAt: Instant,
     ): Mono<PreEntryResult> =
         orderExecutor
             .confirmHardStop(
@@ -251,6 +259,7 @@ class PreEntryExecutionService internal constructor(
                             hardStopClientOrderId =
                                 confirmation.intent.clientOrderId,
                             hardStopPrice = structuralStopPrice,
+                            preEntryFilledAt = preEntryFilledAt,
                         )
                         .thenReturn(
                             PreEntryResult(
@@ -502,14 +511,14 @@ private fun PreEntryOpportunity.entryRequest(
         price = limitPrice,
     )
 
-private fun minimumFillSatisfied(
+internal fun minimumFillSatisfied(
     filledQuantity: BigDecimal,
     requestedQuantity: BigDecimal,
 ): Boolean =
     filledQuantity.multiply(ONE_HUNDRED) >=
         requestedQuantity.multiply(MINIMUM_FILL_PERCENT)
 
-private fun closingSide(positionAmount: BigDecimal): OrderSide =
+internal fun closingSide(positionAmount: BigDecimal): OrderSide =
     if (positionAmount.signum() > 0) OrderSide.SELL else OrderSide.BUY
 
 private fun BinanceSymbolLeverageBrackets.riskBracket(

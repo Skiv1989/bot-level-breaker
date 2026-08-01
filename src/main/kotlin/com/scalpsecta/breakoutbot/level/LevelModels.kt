@@ -52,6 +52,11 @@ data class LevelSnapshot(
     val ownsExposure: Boolean,
     val hasUnresolvedOrder: Boolean,
     val deleteAllowed: Boolean,
+    val preEntryFilledAt: Instant? = null,
+    val crossingTradeId: Long? = null,
+    val crossedAt: Instant? = null,
+    val confirmationStartedAt: Instant? = null,
+    val breakoutConfirmedAt: Instant? = null,
 )
 
 data class LevelEntryTranche(
@@ -72,6 +77,11 @@ enum class LevelState {
     APPROACH,
     PRE_ENTRY_PENDING,
     PRE_ENTRY,
+    CROSS_ENTRY_PENDING,
+    BREAK_CONFIRM,
+    CONFIRM_ENTRY_PENDING,
+    POSITION_MANAGEMENT,
+    EXITING,
     TERMINAL,
 }
 
@@ -111,6 +121,11 @@ enum class LevelReasonCode {
     INSUFFICIENT_LIQUIDITY,
     STOP_SETUP_FAILED,
     CROSS_BEFORE_PROTECTED,
+    PRE_ENTRY_INVALIDATED,
+    PRE_ENTRY_TIMEOUT,
+    BREAK_CONFIRM_FAILED,
+    MARKET_DATA_FAILURE,
+    PRIVATE_STREAM_FAILURE,
     ORDER_OUTCOME_UNKNOWN,
 }
 

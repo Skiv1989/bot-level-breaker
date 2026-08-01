@@ -273,6 +273,7 @@ private class FakePreEntryLevelCoordinator(
         confirmedPositionQuantity: BigDecimal,
         hardStopClientOrderId: String,
         hardStopPrice: BigDecimal,
+        preEntryFilledAt: Instant?,
     ): Mono<Void> =
         Mono.defer {
             if (failProtectionAsCross) {

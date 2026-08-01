@@ -9,6 +9,13 @@ import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.domain.BinanceReadiness
 import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
 import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
+import com.scalpsecta.breakoutbot.execution.BreakoutAdditionRequest
+import com.scalpsecta.breakoutbot.execution.BreakoutContinuationDecision
+import com.scalpsecta.breakoutbot.execution.BreakoutDispatchDecision
+import com.scalpsecta.breakoutbot.execution.BreakoutExecutionRequest
+import com.scalpsecta.breakoutbot.execution.BreakoutExitRequest
+import com.scalpsecta.breakoutbot.execution.BreakoutLevelCoordinator
+import com.scalpsecta.breakoutbot.execution.BreakoutTranche
 import com.scalpsecta.breakoutbot.execution.PreEntryLevelCoordinator
 import com.scalpsecta.breakoutbot.execution.PreEntryOpportunity
 import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
@@ -60,7 +67,7 @@ class LevelService internal constructor(
                 .snapshots()
                 .firstOrNull { snapshot -> snapshot.symbol == symbol }
         },
-) : PreEntryLevelCoordinator {
+) : PreEntryLevelCoordinator, BreakoutLevelCoordinator {
     @Autowired
     constructor(
         client: AuthenticatedBinanceClient,
@@ -97,6 +104,10 @@ class LevelService internal constructor(
         .many()
         .multicast()
         .onBackpressureBuffer<UUID>()
+    private val breakoutRequestSink = Sinks
+        .many()
+        .multicast()
+        .onBackpressureBuffer<BreakoutExecutionRequest>()
 
     fun create(command: CreateLevelCommand): Mono<LevelSnapshot> =
         Mono.defer {
@@ -260,6 +271,9 @@ class LevelService internal constructor(
     override fun opportunities(): Flux<UUID> =
         preEntryOpportunitySink.asFlux()
 
+    override fun breakoutRequests(): Flux<BreakoutExecutionRequest> =
+        breakoutRequestSink.asFlux()
+
     override fun prepare(levelId: UUID): Mono<PreEntryOpportunity> =
         submitPreEntryEvent(
             levelId = levelId,
@@ -310,6 +324,7 @@ class LevelService internal constructor(
         confirmedPositionQuantity: BigDecimal,
         hardStopClientOrderId: String,
         hardStopPrice: BigDecimal,
+        preEntryFilledAt: Instant?,
     ): Mono<Void> =
         submitPreEntryEvent(
             levelId = levelId,
@@ -319,6 +334,57 @@ class LevelService internal constructor(
                     confirmedPositionQuantity = confirmedPositionQuantity,
                     hardStopClientOrderId = hardStopClientOrderId,
                     hardStopPrice = hardStopPrice,
+                    preEntryFilledAt = preEntryFilledAt,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).then()
+
+    override fun validateAddition(
+        request: BreakoutAdditionRequest,
+    ): Mono<BreakoutDispatchDecision> =
+        submitPreEntryEvent(
+            levelId = request.levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.ValidateBreakoutAddition(
+                    request = request,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).map { result -> result as BreakoutDispatchDecision }
+
+    override fun recordCrossingFill(
+        requestId: String,
+        levelId: UUID,
+        confirmedPositionQuantity: BigDecimal,
+    ): Mono<BreakoutContinuationDecision> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.CrossingFilled(
+                    requestId = requestId,
+                    levelId = levelId,
+                    confirmedPositionQuantity = confirmedPositionQuantity,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).map { result -> result as BreakoutContinuationDecision }
+
+    override fun recordFinalFill(
+        requestId: String,
+        levelId: UUID,
+        confirmedPositionQuantity: BigDecimal,
+    ): Mono<Void> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.FinalFilled(
+                    requestId = requestId,
+                    levelId = levelId,
+                    confirmedPositionQuantity = confirmedPositionQuantity,
                     processedAt = clock.instant(),
                     publicMarketData = publicMarketData,
                 )
@@ -374,6 +440,7 @@ class LevelService internal constructor(
         }
         symbolConfigurationPermits.clear()
         preEntryOpportunitySink.tryEmitComplete()
+        breakoutRequestSink.tryEmitComplete()
         runtimes.forEach(SymbolRuntime::close)
         eventScheduler.dispose()
     }
@@ -421,6 +488,15 @@ class LevelService internal constructor(
                 is SymbolLevelEvent.TerminatePreEntry ->
                     terminatePreEntry(event)
 
+                is SymbolLevelEvent.ValidateBreakoutAddition ->
+                    validateBreakoutAddition(event)
+
+                is SymbolLevelEvent.CrossingFilled ->
+                    recordCrossingFill(event)
+
+                is SymbolLevelEvent.FinalFilled ->
+                    recordFinalFill(event)
+
                 is SymbolLevelEvent.AggregateTrade -> {
                     evidenceRecorder.record(event.event)
                     levelsForSymbol(symbol).forEach { stored ->
@@ -464,6 +540,13 @@ class LevelService internal constructor(
                             }
                         }
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
+                        advanceBreakout(
+                            stored = stored,
+                            processedAt = event.processedAt,
+                            publicMarketData = event.publicMarketData,
+                            marketHealthy = event.marketHealthy,
+                            crossingTrade = event.event,
+                        )
                         recordStateTransition(
                             before = before,
                             after = stored.snapshot,
@@ -498,6 +581,12 @@ class LevelService internal constructor(
                             publicMarketData = event.publicMarketData,
                         )
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
+                        advanceBreakout(
+                            stored = stored,
+                            processedAt = event.processedAt,
+                            publicMarketData = event.publicMarketData,
+                            marketHealthy = event.marketHealthy,
+                        )
                         recordStateTransition(
                             before = before,
                             after = stored.snapshot,
@@ -538,6 +627,12 @@ class LevelService internal constructor(
                             )
                         }
                         refreshSignal(stored, event.processedAt, event.publicMarketData)
+                        advanceBreakout(
+                            stored = stored,
+                            processedAt = event.processedAt,
+                            publicMarketData = event.publicMarketData,
+                            marketHealthy = event.marketHealthy,
+                        )
                         recordStateTransition(
                             before = before,
                             after = stored.snapshot,
@@ -789,6 +884,9 @@ class LevelService internal constructor(
         val before = stored.snapshot
         stored.preEntryPreparationInProgress = false
         stored.preparedOpportunity = null
+        stored.pendingBreakoutRequest = null
+        stored.breakoutRequestClaimed = false
+        stored.deferredBreakoutReason = null
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.PRE_ENTRY_PENDING,
             stateChangedAt = event.processedAt,
@@ -845,6 +943,10 @@ class LevelService internal constructor(
                 "Level ${event.levelId} is no longer awaiting pre-entry protection",
             )
         }
+        val filledAt = minOf(
+            event.preEntryFilledAt ?: event.processedAt,
+            event.processedAt,
+        )
         val before = stored.snapshot
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.PRE_ENTRY,
@@ -858,6 +960,7 @@ class LevelService internal constructor(
             ownsExposure = true,
             hasUnresolvedOrder = false,
             deleteAllowed = false,
+            preEntryFilledAt = filledAt,
         )
         return currentSnapshot(
             stored = stored,
@@ -867,6 +970,22 @@ class LevelService internal constructor(
             now = event.processedAt,
         ).also { after ->
             stored.snapshot = after
+            val observedTradePrices = stored.signalTracker.tradePrices(
+                now = event.processedAt,
+                duration = Duration.between(filledAt, event.processedAt),
+            ).toMutableList()
+            after.signal.latestTradePrice?.let { latestPrice ->
+                if (observedTradePrices.lastOrNull() != latestPrice) {
+                    observedTradePrices += latestPrice
+                }
+            }
+            stored.breakoutStateMachine.startPreEntry(
+                direction = after.direction,
+                levelPrice = after.normalizedLevelPrice,
+                frozenNpu = checkNotNull(after.signal.npu.absolute),
+                filledAt = filledAt,
+                observedTradePrices = observedTradePrices,
+            )
             recordStateTransition(before, after, event.publicMarketData)
         }
     }
@@ -884,6 +1003,9 @@ class LevelService internal constructor(
         val before = stored.snapshot
         stored.preEntryPreparationInProgress = false
         stored.preparedOpportunity = null
+        stored.pendingBreakoutRequest = null
+        stored.breakoutRequestClaimed = false
+        stored.deferredBreakoutReason = null
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.TERMINAL,
             stateChangedAt = if (before.state == LevelState.TERMINAL) {
@@ -913,6 +1035,397 @@ class LevelService internal constructor(
             recordStateTransition(before, after, event.publicMarketData)
         }
     }
+
+    private fun validateBreakoutAddition(
+        event: SymbolLevelEvent.ValidateBreakoutAddition,
+    ): BreakoutDispatchDecision {
+        val stored = levels[event.request.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.request.levelId} does not exist",
+        )
+        val before = stored.snapshot
+        refreshSignal(stored, event.processedAt, event.publicMarketData)
+        val pending = stored.pendingBreakoutRequest
+        val freshRequest = buildBreakoutAdditionRequest(
+            stored = stored,
+            tranche = event.request.tranche,
+            requestId = event.request.requestId,
+        ) ?: event.request
+        val expectedState = when (event.request.tranche) {
+            BreakoutTranche.CROSSING -> LevelState.CROSS_ENTRY_PENDING
+            BreakoutTranche.FINAL -> LevelState.CONFIRM_ENTRY_PENDING
+        }
+        val valid =
+            stored.snapshot.state == expectedState &&
+                pending?.requestId == event.request.requestId &&
+                pending.tranche == event.request.tranche &&
+                !stored.breakoutRequestClaimed &&
+                stored.deferredBreakoutReason == null &&
+                additionGatesValid(stored, event.publicMarketData) &&
+                freshRequest.hardStopClientOrderId ==
+                stored.snapshot.hardStopClientOrderId
+        if (valid) {
+            stored.pendingBreakoutRequest = freshRequest
+            stored.breakoutRequestClaimed = true
+            return BreakoutDispatchDecision(
+                request = freshRequest,
+                dispatchAllowed = true,
+            )
+        }
+        val reason = stored.deferredBreakoutReason ?: when (event.request.tranche) {
+            BreakoutTranche.CROSSING -> LevelReasonCode.PRE_ENTRY_INVALIDATED
+            BreakoutTranche.FINAL -> LevelReasonCode.BREAK_CONFIRM_FAILED
+        }
+        transitionToExiting(stored, event.processedAt, reason)
+        refreshSignal(stored, event.processedAt, event.publicMarketData)
+        recordStateTransition(before, stored.snapshot, event.publicMarketData)
+        return BreakoutDispatchDecision(
+            request = freshRequest,
+            dispatchAllowed = false,
+            terminalReason = reason,
+        )
+    }
+
+    private fun recordCrossingFill(
+        event: SymbolLevelEvent.CrossingFilled,
+    ): BreakoutContinuationDecision {
+        require(event.confirmedPositionQuantity.signum() > 0) {
+            "confirmedPositionQuantity must be positive"
+        }
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        val pending = stored.pendingBreakoutRequest
+        check(
+            stored.snapshot.state == LevelState.CROSS_ENTRY_PENDING &&
+                stored.breakoutRequestClaimed &&
+                pending?.requestId == event.requestId &&
+                pending.tranche == BreakoutTranche.CROSSING,
+        ) {
+            "Crossing request ${event.requestId} is no longer active"
+        }
+        val before = stored.snapshot
+        stored.pendingBreakoutRequest = null
+        stored.breakoutRequestClaimed = false
+        stored.snapshot = stored.snapshot.copy(
+            confirmedPositionQuantity = event.confirmedPositionQuantity,
+            hasUnresolvedOrder = false,
+        )
+        val deferredReason = stored.deferredBreakoutReason
+        stored.deferredBreakoutReason = null
+        if (deferredReason != null) {
+            transitionToExiting(stored, event.processedAt, deferredReason)
+            refreshSignal(stored, event.processedAt, event.publicMarketData)
+            recordStateTransition(before, stored.snapshot, event.publicMarketData)
+            return BreakoutContinuationDecision(
+                continueAttempt = false,
+                terminalReason = deferredReason,
+            )
+        }
+        stored.breakoutStateMachine.startConfirmation(event.processedAt)
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.BREAK_CONFIRM,
+            stateChangedAt = event.processedAt,
+            terminalReason = null,
+            confirmationStartedAt = event.processedAt,
+        )
+        refreshSignal(stored, event.processedAt, event.publicMarketData)
+        val confirmation = stored.breakoutStateMachine.evaluateConfirmation(
+            breakoutObservation(
+                stored = stored,
+                processedAt = event.processedAt,
+                publicMarketData = event.publicMarketData,
+            ),
+        )
+        if (confirmation.status == BreakoutConfirmationStatus.FAILED) {
+            val reason = checkNotNull(confirmation.terminalReason)
+            transitionToExiting(stored, event.processedAt, reason)
+            refreshSignal(stored, event.processedAt, event.publicMarketData)
+            recordStateTransition(before, stored.snapshot, event.publicMarketData)
+            return BreakoutContinuationDecision(
+                continueAttempt = false,
+                terminalReason = reason,
+            )
+        }
+        recordStateTransition(before, stored.snapshot, event.publicMarketData)
+        return BreakoutContinuationDecision(continueAttempt = true)
+    }
+
+    private fun recordFinalFill(
+        event: SymbolLevelEvent.FinalFilled,
+    ): LevelSnapshot {
+        require(event.confirmedPositionQuantity.signum() > 0) {
+            "confirmedPositionQuantity must be positive"
+        }
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        val pending = stored.pendingBreakoutRequest
+        check(
+            stored.snapshot.state == LevelState.CONFIRM_ENTRY_PENDING &&
+                stored.breakoutRequestClaimed &&
+                pending?.requestId == event.requestId &&
+                pending.tranche == BreakoutTranche.FINAL,
+        ) {
+            "Final request ${event.requestId} is no longer active"
+        }
+        val before = stored.snapshot
+        stored.pendingBreakoutRequest = null
+        stored.breakoutRequestClaimed = false
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.POSITION_MANAGEMENT,
+            stateChangedAt = event.processedAt,
+            terminalReason = null,
+            confirmedPositionQuantity = event.confirmedPositionQuantity,
+            ownsActiveAttempt = true,
+            ownsExposure = true,
+            hasUnresolvedOrder = false,
+            deleteAllowed = false,
+        )
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        ).also { after ->
+            stored.snapshot = after
+            recordStateTransition(before, after, event.publicMarketData)
+        }
+    }
+
+    private fun advanceBreakout(
+        stored: StoredLevel,
+        processedAt: Instant,
+        publicMarketData: PublicMarketDataSnapshot?,
+        marketHealthy: Boolean,
+        crossingTrade: AggregateTradeEvent? = null,
+    ) {
+        val observation = breakoutObservation(
+            stored = stored,
+            processedAt = processedAt,
+            publicMarketData = publicMarketData,
+            marketHealthy = marketHealthy,
+        )
+        when (stored.snapshot.state) {
+            LevelState.PRE_ENTRY -> {
+                val invalidation = stored.breakoutStateMachine.evaluatePreBreak(
+                    observation = observation,
+                    includeNoCrossTimeout = false,
+                )
+                if (invalidation != null) {
+                    startBreakoutExit(stored, processedAt, invalidation)
+                    return
+                }
+                if (
+                    crossingTrade != null &&
+                    crossesLevel(stored, crossingTrade.price)
+                ) {
+                    if (additionGatesValid(stored, publicMarketData)) {
+                        beginCrossing(stored, crossingTrade, processedAt)
+                    } else {
+                        startBreakoutExit(
+                            stored,
+                            processedAt,
+                            LevelReasonCode.PRE_ENTRY_INVALIDATED,
+                        )
+                    }
+                    return
+                }
+                val timeout = stored.breakoutStateMachine.evaluatePreBreak(
+                    observation = observation,
+                    includeNoCrossTimeout = true,
+                )
+                if (timeout != null) {
+                    startBreakoutExit(stored, processedAt, timeout)
+                }
+            }
+
+            LevelState.CROSS_ENTRY_PENDING -> {
+                val invalidation = stored.breakoutStateMachine.evaluatePreBreak(
+                    observation = observation,
+                    includeNoCrossTimeout = false,
+                )
+                if (invalidation != null) {
+                    stored.deferredBreakoutReason =
+                        stored.deferredBreakoutReason ?: invalidation
+                }
+            }
+
+            LevelState.BREAK_CONFIRM -> {
+                val confirmation = stored.breakoutStateMachine
+                    .evaluateConfirmation(observation)
+                when (confirmation.status) {
+                    BreakoutConfirmationStatus.PENDING -> Unit
+                    BreakoutConfirmationStatus.FAILED -> startBreakoutExit(
+                        stored = stored,
+                        processedAt = processedAt,
+                        reason = checkNotNull(confirmation.terminalReason),
+                    )
+
+                    BreakoutConfirmationStatus.PASSED ->
+                        beginFinalAddition(stored, processedAt)
+                }
+            }
+
+            else -> Unit
+        }
+    }
+
+    private fun beginCrossing(
+        stored: StoredLevel,
+        trade: AggregateTradeEvent,
+        processedAt: Instant,
+    ) {
+        stored.breakoutStateMachine.markCrossed()
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.CROSS_ENTRY_PENDING,
+            stateChangedAt = processedAt,
+            terminalReason = null,
+            crossingTradeId = trade.aggregateTradeId,
+            crossedAt = trade.receivedAt,
+        )
+        val request = checkNotNull(
+            buildBreakoutAdditionRequest(
+                stored = stored,
+                tranche = BreakoutTranche.CROSSING,
+                requestId = "cross:${trade.aggregateTradeId}",
+            ),
+        )
+        stored.pendingBreakoutRequest = request
+        breakoutRequestSink.tryEmitNext(request)
+    }
+
+    private fun beginFinalAddition(
+        stored: StoredLevel,
+        processedAt: Instant,
+    ) {
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.CONFIRM_ENTRY_PENDING,
+            stateChangedAt = processedAt,
+            terminalReason = null,
+            breakoutConfirmedAt = processedAt,
+        )
+        val request = buildBreakoutAdditionRequest(
+            stored = stored,
+            tranche = BreakoutTranche.FINAL,
+            requestId = "final:${processedAt.toEpochMilli()}",
+        )
+        if (request == null) {
+            startBreakoutExit(
+                stored,
+                processedAt,
+                LevelReasonCode.BREAK_CONFIRM_FAILED,
+            )
+            return
+        }
+        stored.pendingBreakoutRequest = request
+        breakoutRequestSink.tryEmitNext(request)
+    }
+
+    private fun startBreakoutExit(
+        stored: StoredLevel,
+        processedAt: Instant,
+        reason: LevelReasonCode,
+    ) {
+        transitionToExiting(stored, processedAt, reason)
+        if (stored.snapshot.confirmedPositionQuantity.signum() == 0) {
+            transitionToTerminal(stored, processedAt, reason)
+            return
+        }
+        breakoutRequestSink.tryEmitNext(
+            BreakoutExitRequest(
+                requestId = "exit:${reason.name}:${processedAt.toEpochMilli()}",
+                levelId = stored.snapshot.id,
+                attemptNumber = stored.snapshot.attemptNumber,
+                symbol = stored.snapshot.symbol,
+                direction = stored.snapshot.direction,
+                confirmedPositionQuantity =
+                    stored.snapshot.confirmedPositionQuantity,
+                reason = reason,
+            ),
+        )
+    }
+
+    private fun transitionToExiting(
+        stored: StoredLevel,
+        processedAt: Instant,
+        reason: LevelReasonCode,
+    ) {
+        stored.pendingBreakoutRequest = null
+        stored.breakoutRequestClaimed = false
+        stored.deferredBreakoutReason = null
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.EXITING,
+            stateChangedAt = processedAt,
+            terminalReason = reason,
+        )
+    }
+
+    private fun additionGatesValid(
+        stored: StoredLevel,
+        publicMarketData: PublicMarketDataSnapshot?,
+    ): Boolean {
+        val snapshot = stored.snapshot
+        return snapshot.attemptConsumed &&
+            snapshot.ownsActiveAttempt &&
+            snapshot.ownsExposure &&
+            !snapshot.hasUnresolvedOrder &&
+            snapshot.hardStopConfirmedAt != null &&
+            snapshot.hardStopClientOrderId != null &&
+            snapshot.hardStopPrice != null &&
+            snapshot.globalState == GlobalTradingState.RUNNING &&
+            snapshot.blockers.isEmpty() &&
+            snapshot.signal.npu.frozen &&
+            snapshot.signal.mandatoryGates.entryEligible &&
+            publicMarketData?.healthy == true &&
+            privateStreamReadinessProvider() == BinanceReadiness.READY
+    }
+
+    private fun buildBreakoutAdditionRequest(
+        stored: StoredLevel,
+        tranche: BreakoutTranche,
+        requestId: String,
+    ): BreakoutAdditionRequest? {
+        val snapshot = stored.snapshot
+        val role = when (tranche) {
+            BreakoutTranche.CROSSING -> LevelEntryRole.CROSSING
+            BreakoutTranche.FINAL -> LevelEntryRole.CONFIRMATION
+        }
+        return BreakoutAdditionRequest(
+            requestId = requestId,
+            levelId = snapshot.id,
+            attemptNumber = snapshot.attemptNumber,
+            symbol = snapshot.symbol,
+            direction = snapshot.direction,
+            confirmedPositionQuantity = snapshot.confirmedPositionQuantity,
+            tranche = tranche,
+            requestedQuantity = snapshot.entryAllocation
+                .single { entry -> entry.role == role }
+                .quantity,
+            bestBidPrice = snapshot.signal.bidPrice ?: return null,
+            bestAskPrice = snapshot.signal.askPrice ?: return null,
+            frozenNpu = snapshot.signal.npu.absolute ?: return null,
+            hardStopClientOrderId = snapshot.hardStopClientOrderId ?: return null,
+            hardStopPrice = snapshot.hardStopPrice ?: return null,
+        )
+    }
+
+    private fun breakoutObservation(
+        stored: StoredLevel,
+        processedAt: Instant,
+        publicMarketData: PublicMarketDataSnapshot?,
+        marketHealthy: Boolean = publicMarketData?.healthy == true,
+    ): BreakoutObservation =
+        BreakoutObservation(
+            observedAt = processedAt,
+            signal = stored.snapshot.signal,
+            publicDataHealthy = marketHealthy,
+            privateDataHealthy =
+                privateStreamReadinessProvider() == BinanceReadiness.READY,
+        )
 
     private fun advanceWarmup(
         stored: StoredLevel,
@@ -1083,6 +1596,9 @@ class LevelService internal constructor(
     ) {
         stored.preEntryPreparationInProgress = false
         stored.preparedOpportunity = null
+        stored.pendingBreakoutRequest = null
+        stored.breakoutRequestClaimed = false
+        stored.deferredBreakoutReason = null
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.TERMINAL,
             stateChangedAt = processedAt,
@@ -1126,6 +1642,13 @@ class LevelService internal constructor(
             LevelState.APPROACH -> "ACTIVATION_BAND_ENTERED"
             LevelState.PRE_ENTRY_PENDING -> "PRE_ENTRY_DISPATCHED"
             LevelState.PRE_ENTRY -> "HARD_STOP_CONFIRMED"
+            LevelState.CROSS_ENTRY_PENDING -> "CROSSING_TRADE"
+            LevelState.BREAK_CONFIRM -> "CROSSING_FILL_RESOLVED"
+            LevelState.CONFIRM_ENTRY_PENDING -> "BREAKOUT_CONFIRMED"
+            LevelState.POSITION_MANAGEMENT -> "FINAL_TRANCHE_FILLED"
+            LevelState.EXITING ->
+                after.terminalReason?.name ?: "BREAKOUT_EXIT"
+
             LevelState.TERMINAL ->
                 after.terminalReason?.name ?: "ATTEMPT_TERMINAL"
 
@@ -1805,6 +2328,11 @@ class LevelService internal constructor(
                 LevelState.APPROACH,
                 LevelState.PRE_ENTRY_PENDING,
                 LevelState.PRE_ENTRY,
+                LevelState.CROSS_ENTRY_PENDING,
+                LevelState.BREAK_CONFIRM,
+                LevelState.CONFIRM_ENTRY_PENDING,
+                LevelState.POSITION_MANAGEMENT,
+                LevelState.EXITING,
                 -> Unit
             }
             when (globalState) {
@@ -1858,6 +2386,10 @@ private data class StoredLevel(
     var npuMode: NpuMode = NpuMode.WARMING_UP,
     var preEntryPreparationInProgress: Boolean = false,
     var preparedOpportunity: PreEntryOpportunity? = null,
+    val breakoutStateMachine: BreakoutStateMachine = BreakoutStateMachine(),
+    var pendingBreakoutRequest: BreakoutAdditionRequest? = null,
+    var breakoutRequestClaimed: Boolean = false,
+    var deferredBreakoutReason: LevelReasonCode? = null,
 ) {
     fun claimsSymbolOwnership(): Boolean =
         snapshot.ownsActiveAttempt ||
@@ -1966,6 +2498,7 @@ private sealed interface SymbolLevelEvent {
         val confirmedPositionQuantity: BigDecimal,
         val hardStopClientOrderId: String,
         val hardStopPrice: BigDecimal,
+        val preEntryFilledAt: Instant?,
         val processedAt: Instant,
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent
@@ -1975,6 +2508,28 @@ private sealed interface SymbolLevelEvent {
         val reason: LevelReasonCode,
         val confirmedRemainingQuantity: BigDecimal,
         val hasUnresolvedOrder: Boolean,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class ValidateBreakoutAddition(
+        val request: BreakoutAdditionRequest,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class CrossingFilled(
+        val requestId: String,
+        val levelId: UUID,
+        val confirmedPositionQuantity: BigDecimal,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class FinalFilled(
+        val requestId: String,
+        val levelId: UUID,
+        val confirmedPositionQuantity: BigDecimal,
         val processedAt: Instant,
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent

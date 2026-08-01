@@ -66,6 +66,7 @@ interface PreEntryLevelCoordinator {
         confirmedPositionQuantity: BigDecimal,
         hardStopClientOrderId: String,
         hardStopPrice: BigDecimal,
+        preEntryFilledAt: Instant? = null,
     ): Mono<Void>
 
     fun terminate(

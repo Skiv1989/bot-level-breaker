@@ -771,7 +771,26 @@ class ExecutionService internal constructor(
         val subscription: Disposable = dispatch(
             intent = closeIntent,
             closeOnUnknown = false,
-        ).subscribe({}, {})
+        )
+            .flatMap { closeResolution ->
+                val remainingQuantity =
+                    closeResolution.confirmedPositionAmount.abs()
+                when {
+                    remainingQuantity.signum() == 0 ->
+                        riskService.recordConfirmedFlat(
+                            closeResolution.intent.levelId,
+                        )
+
+                    remainingQuantity < positionAmount.abs() ->
+                        riskService.recordConfirmedReducingFill(
+                            levelId = closeResolution.intent.levelId,
+                            confirmedRemainingQuantity = remainingQuantity,
+                        )
+
+                    else -> Mono.just(riskService.currentState())
+                }
+            }
+            .subscribe({}, {})
         subscriptions.add(subscription)
     }
 
@@ -870,10 +889,13 @@ class ExecutionService internal constructor(
         actualFilledQuantity: BigDecimal,
     ): BigDecimal {
         if (!intent.role.closesExposure) {
-            return when (intent.side) {
+            val signedFill = when (intent.side) {
                 OrderSide.BUY -> actualFilledQuantity
                 OrderSide.SELL -> actualFilledQuantity.negate()
             }
+            return intent.confirmedPositionAmount
+                ?.add(signedFill)
+                ?: signedFill
         }
         val originalPosition = checkNotNull(intent.confirmedPositionAmount)
         val remaining = originalPosition.abs()
