@@ -28,7 +28,10 @@ class BotStateService(
             authenticatedBinance.privateStream.readiness
         val clockReadiness = authenticatedBinance.clock.readiness
         val accountReadiness = authenticatedBinance.account.readiness
-        val levels = levelService.currentState()
+        val levels = levelService.currentState(
+            privateStreamReadiness = privateStreamReadiness,
+            publicMarketData = publicMarketData,
+        )
         return RuntimeSnapshot(
             startedAt = startedAt,
             levelCount = levels.size,

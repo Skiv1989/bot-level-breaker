@@ -1,5 +1,6 @@
 package com.scalpsecta.breakoutbot.level
 
+import com.scalpsecta.breakoutbot.signal.LevelSignalSnapshot
 import java.math.BigDecimal
 import java.time.Instant
 import java.util.UUID
@@ -35,6 +36,7 @@ data class LevelSnapshot(
     val estimatedLiquidationPrice: BigDecimal,
     val state: LevelState,
     val blockers: List<LevelBlocker>,
+    val signal: LevelSignalSnapshot,
     val ownsExposure: Boolean,
     val hasUnresolvedOrder: Boolean,
     val deleteAllowed: Boolean,
@@ -78,4 +80,3 @@ class LevelException(
     message: String,
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
-

@@ -6,11 +6,15 @@ import com.scalpsecta.breakoutbot.binance.BinanceLotSizeFilter
 import com.scalpsecta.breakoutbot.binance.BinanceMarginType
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
+import com.scalpsecta.breakoutbot.domain.BinanceReadiness
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
-import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSubscription
+import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
+import com.scalpsecta.breakoutbot.signal.LevelSignalTracker
+import com.scalpsecta.breakoutbot.signal.NpuMode
 import jakarta.annotation.PreDestroy
 import org.springframework.stereotype.Service
 import reactor.core.publisher.Mono
+import reactor.core.scheduler.Scheduler
 import reactor.core.scheduler.Schedulers
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -32,6 +36,7 @@ class LevelService(
     private val levels = linkedMapOf<UUID, StoredLevel>()
     private val symbolConfigurationPermits =
         ConcurrentHashMap<String, Semaphore>()
+    private val signalScheduler: Scheduler = Schedulers.newSingle("level-signals")
 
     fun create(command: CreateLevelCommand): Mono<LevelSnapshot> =
         Mono.defer {
@@ -85,21 +90,43 @@ class LevelService(
                 "Level $levelId disappeared while the level lock was held"
             }
         }
-        removed.marketDataSubscription.close()
-        return removed.snapshot
+        val result = currentSnapshot(
+            stored = removed,
+            publicMarketData = publicMarketDataService
+                .snapshots()
+                .firstOrNull { snapshot -> snapshot.symbol == removed.snapshot.symbol },
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+        )
+        removed.signalTracker.close()
+        return result
     }
 
-    fun currentState(): List<LevelSnapshot> =
-        lock.withLock {
-            levels.values.map { stored -> stored.snapshot }
+    fun currentState(
+        privateStreamReadiness: BinanceReadiness = BinanceReadiness.NOT_READY,
+        publicMarketData: List<PublicMarketDataSnapshot> =
+            publicMarketDataService.snapshots(),
+    ): List<LevelSnapshot> {
+        val publicMarketDataBySymbol = publicMarketData.associateBy { snapshot ->
+            snapshot.symbol
         }
+        return lock.withLock {
+            levels.values.map { stored ->
+                currentSnapshot(
+                    stored = stored,
+                    publicMarketData =
+                        publicMarketDataBySymbol[stored.snapshot.symbol],
+                    privateStreamReadiness = privateStreamReadiness,
+                )
+            }
+        }
+    }
 
     fun recordOwnership(
         levelId: UUID,
         ownsExposure: Boolean,
         hasUnresolvedOrder: Boolean,
-    ): LevelSnapshot =
-        lock.withLock {
+    ): LevelSnapshot {
+        val updated = lock.withLock {
             val stored = levels[levelId] ?: throw levelError(
                 LevelReasonCode.LEVEL_NOT_FOUND,
                 "Level $levelId does not exist",
@@ -110,18 +137,52 @@ class LevelService(
                 deleteAllowed = !ownsExposure && !hasUnresolvedOrder,
             )
             stored.snapshot = updated
-            updated
+            UpdatedStoredLevel(stored, updated)
         }
+        val publicMarketData = publicMarketDataService
+            .snapshots()
+            .firstOrNull { snapshot -> snapshot.symbol == updated.snapshot.symbol }
+        return updated.snapshot.copy(
+            signal = updated.stored.signalTracker.snapshot(
+                publicMarketData = publicMarketData,
+                privateStreamReadiness = BinanceReadiness.NOT_READY,
+                hasUnresolvedOrder = updated.snapshot.hasUnresolvedOrder,
+            ),
+        )
+    }
+
+    internal fun updateSignalNpuMode(
+        levelId: UUID,
+        mode: NpuMode,
+    ): LevelSnapshot {
+        val stored = lock.withLock {
+            val current = levels[levelId] ?: throw levelError(
+                LevelReasonCode.LEVEL_NOT_FOUND,
+                "Level $levelId does not exist",
+            )
+            current.signalTracker.updateNpuMode(mode)
+            current
+        }
+        val publicMarketData = publicMarketDataService
+            .snapshots()
+            .firstOrNull { snapshot -> snapshot.symbol == stored.snapshot.symbol }
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+        )
+    }
 
     @PreDestroy
     fun close() {
-        val subscriptions = lock.withLock {
+        val trackers = lock.withLock {
             levels.values
-                .map(StoredLevel::marketDataSubscription)
+                .map(StoredLevel::signalTracker)
                 .also { levels.clear() }
         }
         symbolConfigurationPermits.clear()
-        subscriptions.forEach(PublicMarketDataSubscription::close)
+        trackers.forEach(LevelSignalTracker::close)
+        signalScheduler.dispose()
     }
 
     private fun validateInput(command: CreateLevelCommand): ValidatedInput {
@@ -257,6 +318,7 @@ class LevelService(
                                 normalizedLevelPrice = sizing.normalizedLevelPrice,
                             ),
                             sizing = sizing,
+                            tickSize = filters.tickSize,
                             leverage = leverage,
                             projectedIsolatedMargin = plannedNotional.divide(
                                 leverage.toBigDecimal(),
@@ -612,6 +674,32 @@ class LevelService(
                 error,
             )
         }
+        val signalTracker = try {
+            LevelSignalTracker(
+                symbol = plan.input.symbol,
+                direction = plan.input.direction,
+                levelPrice = plan.sizing.normalizedLevelPrice,
+                tickSize = plan.tickSize,
+                marketDataSubscription = marketDataSubscription,
+                clock = clock,
+                scheduler = signalScheduler,
+            )
+        } catch (error: RuntimeException) {
+            marketDataSubscription.close()
+            throw levelError(
+                LevelReasonCode.INVALID_LEVEL,
+                "Could not start signal calculation for ${plan.input.symbol}",
+                error,
+            )
+        }
+        val initialPublicMarketData = publicMarketDataService
+            .snapshots()
+            .firstOrNull { snapshot -> snapshot.symbol == plan.input.symbol }
+        val initialSignal = signalTracker.snapshot(
+            publicMarketData = initialPublicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            hasUnresolvedOrder = false,
+        )
         try {
             return lock.withLock {
                 if (levels.values.any { stored -> stored.key == plan.key }) {
@@ -644,6 +732,7 @@ class LevelService(
                     estimatedLiquidationPrice = plan.estimatedLiquidationPrice,
                     state = LevelState.WARMING_UP,
                     blockers = listOf(LevelBlocker.WARMING_UP),
+                    signal = initialSignal,
                     ownsExposure = false,
                     hasUnresolvedOrder = false,
                     deleteAllowed = true,
@@ -651,15 +740,28 @@ class LevelService(
                 levels[snapshot.id] = StoredLevel(
                     key = plan.key,
                     snapshot = snapshot,
-                    marketDataSubscription = marketDataSubscription,
+                    signalTracker = signalTracker,
                 )
                 snapshot
             }
         } catch (error: RuntimeException) {
-            marketDataSubscription.close()
+            signalTracker.close()
             throw error
         }
     }
+
+    private fun currentSnapshot(
+        stored: StoredLevel,
+        publicMarketData: PublicMarketDataSnapshot?,
+        privateStreamReadiness: BinanceReadiness,
+    ): LevelSnapshot =
+        stored.snapshot.copy(
+            signal = stored.signalTracker.snapshot(
+                publicMarketData = publicMarketData,
+                privateStreamReadiness = privateStreamReadiness,
+                hasUnresolvedOrder = stored.snapshot.hasUnresolvedOrder,
+            ),
+        )
 
     private fun roundToIncrement(
         value: BigDecimal,
@@ -688,7 +790,12 @@ class LevelService(
 private data class StoredLevel(
     val key: LevelKey,
     var snapshot: LevelSnapshot,
-    val marketDataSubscription: PublicMarketDataSubscription,
+    val signalTracker: LevelSignalTracker,
+)
+
+private data class UpdatedStoredLevel(
+    val stored: StoredLevel,
+    val snapshot: LevelSnapshot,
 )
 
 private data class ValidatedInput(
@@ -718,6 +825,7 @@ private data class LevelPlan(
     val input: ValidatedInput,
     val key: LevelKey,
     val sizing: PlannedSizing,
+    val tickSize: BigDecimal,
     val leverage: Int,
     val projectedIsolatedMargin: BigDecimal,
     val riskBoundaryStopPrice: BigDecimal,

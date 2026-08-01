@@ -18,6 +18,7 @@ import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
 import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataStreamProvider
+import com.scalpsecta.breakoutbot.signal.NpuMode
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowableOfType
 import org.junit.jupiter.api.AfterEach
@@ -82,6 +83,9 @@ class LevelServiceTest {
             .isLessThan(created.riskBoundaryStopPrice)
         assertThat(created.state).isEqualTo(LevelState.WARMING_UP)
         assertThat(created.blockers).containsExactly(LevelBlocker.WARMING_UP)
+        assertThat(created.signal.windows.fast.tradeCount).isZero()
+        assertThat(created.signal.pressureScore.diagnosticOnly).isTrue()
+        assertThat(created.signal.mandatoryGates.entryEligible).isFalse()
         assertThat(created.deleteAllowed).isTrue()
         assertThat(service.currentState()).containsExactly(created)
         assertThat(marketDataService.activeSymbolCount()).isOne()
@@ -258,6 +262,21 @@ class LevelServiceTest {
         assertThat(service.delete(created.id).id).isEqualTo(created.id)
         assertThat(service.currentState()).isEmpty()
         assertThat(marketDataService.activeSymbolCount()).isZero()
+    }
+
+    @Test
+    fun `signal NPU mode recomputes when armed and freezes on approach`() {
+        val created = service.create(command()).block()!!
+
+        val armed = service.updateSignalNpuMode(created.id, NpuMode.ARMED)
+        assertThat(armed.signal.npu.absolute)
+            .isEqualByComparingTo(BigDecimal("0.1"))
+        assertThat(armed.signal.npu.frozen).isFalse()
+
+        val approach = service.updateSignalNpuMode(created.id, NpuMode.FROZEN)
+        assertThat(approach.signal.npu.absolute)
+            .isEqualByComparingTo(BigDecimal("0.1"))
+        assertThat(approach.signal.npu.frozen).isTrue()
     }
 
     private fun command(
