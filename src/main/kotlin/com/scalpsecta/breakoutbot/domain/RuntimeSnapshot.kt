@@ -1,6 +1,7 @@
 package com.scalpsecta.breakoutbot.domain
 
 import com.scalpsecta.breakoutbot.binance.AuthenticatedBinanceSnapshot
+import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import com.scalpsecta.breakoutbot.level.LevelSnapshot
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
 import java.time.Instant
@@ -10,6 +11,7 @@ data class RuntimeSnapshot(
     val levelCount: Int,
     val levels: List<LevelSnapshot>,
     val recoveredAttemptCount: Int,
+    val globalTradingState: GlobalTradingState,
     val publicMarketData: List<PublicMarketDataSnapshot>,
     val authenticatedBinance: AuthenticatedBinanceSnapshot,
     val health: RuntimeHealth,

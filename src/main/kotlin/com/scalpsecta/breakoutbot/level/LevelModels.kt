@@ -35,8 +35,13 @@ data class LevelSnapshot(
     val riskBoundaryStopPrice: BigDecimal,
     val estimatedLiquidationPrice: BigDecimal,
     val state: LevelState,
+    val stateChangedAt: Instant,
+    val warmupHealthySince: Instant?,
+    val terminalReason: LevelReasonCode?,
+    val globalState: GlobalTradingState,
     val blockers: List<LevelBlocker>,
     val signal: LevelSignalSnapshot,
+    val ownsActiveAttempt: Boolean,
     val ownsExposure: Boolean,
     val hasUnresolvedOrder: Boolean,
     val deleteAllowed: Boolean,
@@ -56,10 +61,27 @@ enum class LevelEntryRole {
 
 enum class LevelState {
     WARMING_UP,
+    ARMED,
+    APPROACH,
+    TERMINAL,
 }
 
 enum class LevelBlocker {
     WARMING_UP,
+    TERMINAL,
+    ENTRY_COOLDOWN,
+    SAFE_MODE,
+    DAILY_LOCKED,
+    MANUAL_LOCK,
+    SYMBOL_HAS_ACTIVE_OWNER,
+}
+
+enum class GlobalTradingState {
+    RUNNING,
+    ENTRY_COOLDOWN,
+    SAFE_MODE,
+    DAILY_LOCKED,
+    MANUAL_LOCK,
 }
 
 enum class LevelReasonCode {
@@ -73,6 +95,8 @@ enum class LevelReasonCode {
     LEVEL_NOT_FOUND,
     LEVEL_HAS_EXPOSURE,
     LEVEL_HAS_UNRESOLVED_ORDER,
+    MISSED_DURING_WARMUP,
+    SYMBOL_OWNERSHIP_CONFLICT,
 }
 
 class LevelException(

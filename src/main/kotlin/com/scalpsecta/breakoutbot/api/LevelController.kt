@@ -37,7 +37,7 @@ class LevelController(
         )
 
     @DeleteMapping("/{levelId}")
-    fun delete(@PathVariable levelId: UUID): LevelSnapshot =
+    fun delete(@PathVariable levelId: UUID): Mono<LevelSnapshot> =
         levelService.delete(levelId)
 }
 
@@ -48,4 +48,3 @@ data class CreateLevelRequest(
     val positionNotionalUsdt: BigDecimal,
     val maxImpulsePct: BigDecimal,
 )
-

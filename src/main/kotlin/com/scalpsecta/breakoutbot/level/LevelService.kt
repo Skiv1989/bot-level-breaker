@@ -7,18 +7,26 @@ import com.scalpsecta.breakoutbot.binance.BinanceMarginType
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.domain.BinanceReadiness
+import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
+import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSnapshot
+import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataSubscription
 import com.scalpsecta.breakoutbot.signal.LevelSignalTracker
 import com.scalpsecta.breakoutbot.signal.NpuMode
 import jakarta.annotation.PreDestroy
+import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import reactor.core.Disposable
+import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import reactor.core.scheduler.Scheduler
 import reactor.core.scheduler.Schedulers
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
+import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
@@ -27,16 +35,30 @@ import kotlin.concurrent.withLock
 import kotlin.math.min
 
 @Service
-class LevelService(
+class LevelService internal constructor(
     private val client: AuthenticatedBinanceClient,
     private val publicMarketDataService: PublicMarketDataService,
     private val clock: Clock,
+    private val automaticTimers: Boolean,
 ) {
+    @Autowired
+    constructor(
+        client: AuthenticatedBinanceClient,
+        publicMarketDataService: PublicMarketDataService,
+        clock: Clock,
+    ) : this(
+        client = client,
+        publicMarketDataService = publicMarketDataService,
+        clock = clock,
+        automaticTimers = true,
+    )
+
     private val lock = ReentrantLock()
     private val levels = linkedMapOf<UUID, StoredLevel>()
+    private val symbolRuntimes = mutableMapOf<String, SymbolRuntime>()
     private val symbolConfigurationPermits =
         ConcurrentHashMap<String, Semaphore>()
-    private val signalScheduler: Scheduler = Schedulers.newSingle("level-signals")
+    private val eventScheduler: Scheduler = Schedulers.newParallel("level-events")
 
     fun create(command: CreateLevelCommand): Mono<LevelSnapshot> =
         Mono.defer {
@@ -64,47 +86,35 @@ class LevelService(
                         checkCollectionConstraints(plan.key)
                         validateLiquidation(plan)
                         configureSymbol(plan)
-                            .then(Mono.fromCallable { store(plan) })
+                            .then(Mono.defer { store(plan) })
                     }
             }
         }
 
-    fun delete(levelId: UUID): LevelSnapshot {
-        val removed = lock.withLock {
-            val stored = levels[levelId] ?: throw levelError(
+    fun delete(levelId: UUID): Mono<LevelSnapshot> {
+        val symbolRuntime = lock.withLock {
+            val symbol = levels[levelId]?.snapshot?.symbol ?: throw levelError(
                 LevelReasonCode.LEVEL_NOT_FOUND,
                 "Level $levelId does not exist",
             )
-            when {
-                stored.snapshot.ownsExposure -> throw levelError(
-                    LevelReasonCode.LEVEL_HAS_EXPOSURE,
-                    "Level $levelId cannot be deleted while it owns exposure",
-                )
-
-                stored.snapshot.hasUnresolvedOrder -> throw levelError(
-                    LevelReasonCode.LEVEL_HAS_UNRESOLVED_ORDER,
-                    "Level $levelId cannot be deleted while it owns an unresolved order",
-                )
-            }
-            checkNotNull(levels.remove(levelId)) {
-                "Level $levelId disappeared while the level lock was held"
-            }
+            checkNotNull(symbolRuntimes[symbol]) {
+                "Event queue for $symbol is missing"
+            }.also { it.pendingEvents += 1 }
         }
-        val result = currentSnapshot(
-            stored = removed,
-            publicMarketData = publicMarketDataService
-                .snapshots()
-                .firstOrNull { snapshot -> snapshot.symbol == removed.snapshot.symbol },
-            privateStreamReadiness = BinanceReadiness.NOT_READY,
+        val event = SymbolLevelEvent.DeleteLevel(
+            levelId = levelId,
+            processedAt = clock.instant(),
+            publicMarketData = publicMarketData(levelId),
         )
-        removed.signalTracker.close()
-        return result
+        return submit(symbolRuntime, event)
+            .map { result -> result as LevelSnapshot }
     }
 
     fun currentState(
         privateStreamReadiness: BinanceReadiness = BinanceReadiness.NOT_READY,
         publicMarketData: List<PublicMarketDataSnapshot> =
             publicMarketDataService.snapshots(),
+        globalState: GlobalTradingState = GlobalTradingState.RUNNING,
     ): List<LevelSnapshot> {
         val publicMarketDataBySymbol = publicMarketData.associateBy { snapshot ->
             snapshot.symbol
@@ -116,74 +126,428 @@ class LevelService(
                     publicMarketData =
                         publicMarketDataBySymbol[stored.snapshot.symbol],
                     privateStreamReadiness = privateStreamReadiness,
+                    globalState = globalState,
                 )
             }
         }
     }
 
-    fun recordOwnership(
+    internal fun recordOwnership(
         levelId: UUID,
+        ownsActiveAttempt: Boolean = false,
         ownsExposure: Boolean,
         hasUnresolvedOrder: Boolean,
-    ): LevelSnapshot {
-        val updated = lock.withLock {
-            val stored = levels[levelId] ?: throw levelError(
+    ): Mono<LevelSnapshot> {
+        val symbolRuntime = lock.withLock {
+            val symbol = levels[levelId]?.snapshot?.symbol ?: throw levelError(
                 LevelReasonCode.LEVEL_NOT_FOUND,
                 "Level $levelId does not exist",
             )
-            val updated = stored.snapshot.copy(
+            checkNotNull(symbolRuntimes[symbol]) {
+                "Event queue for $symbol is missing"
+            }.also { it.pendingEvents += 1 }
+        }
+        return submit(
+            symbolRuntime,
+            SymbolLevelEvent.UpdateOwnership(
+                levelId = levelId,
+                ownsActiveAttempt = ownsActiveAttempt,
                 ownsExposure = ownsExposure,
                 hasUnresolvedOrder = hasUnresolvedOrder,
-                deleteAllowed = !ownsExposure && !hasUnresolvedOrder,
-            )
-            stored.snapshot = updated
-            UpdatedStoredLevel(stored, updated)
-        }
-        val publicMarketData = publicMarketDataService
-            .snapshots()
-            .firstOrNull { snapshot -> snapshot.symbol == updated.snapshot.symbol }
-        return updated.snapshot.copy(
-            signal = updated.stored.signalTracker.snapshot(
-                publicMarketData = publicMarketData,
-                privateStreamReadiness = BinanceReadiness.NOT_READY,
-                hasUnresolvedOrder = updated.snapshot.hasUnresolvedOrder,
+                processedAt = clock.instant(),
+                publicMarketData = publicMarketData(levelId),
             ),
         )
+            .map { result -> result as LevelSnapshot }
     }
 
-    internal fun updateSignalNpuMode(
-        levelId: UUID,
-        mode: NpuMode,
-    ): LevelSnapshot {
-        val stored = lock.withLock {
-            val current = levels[levelId] ?: throw levelError(
-                LevelReasonCode.LEVEL_NOT_FOUND,
-                "Level $levelId does not exist",
-            )
-            current.signalTracker.updateNpuMode(mode)
-            current
-        }
-        val publicMarketData = publicMarketDataService
-            .snapshots()
-            .firstOrNull { snapshot -> snapshot.symbol == stored.snapshot.symbol }
-        return currentSnapshot(
-            stored = stored,
-            publicMarketData = publicMarketData,
-            privateStreamReadiness = BinanceReadiness.NOT_READY,
+    internal fun process(
+        event: AggregateTradeEvent,
+        marketHealthy: Boolean,
+    ): Mono<Void> =
+        submitSymbolEvent(
+            symbol = event.symbol,
+            event = SymbolLevelEvent.AggregateTrade(
+                event = event,
+                processedAt = clock.instant(),
+                publicMarketData = null,
+                marketHealthy = marketHealthy,
+            ),
         )
-    }
+
+    internal fun process(
+        event: BookTickerEvent,
+        marketHealthy: Boolean,
+    ): Mono<Void> =
+        submitSymbolEvent(
+            symbol = event.symbol,
+            event = SymbolLevelEvent.BookTicker(
+                event = event,
+                processedAt = clock.instant(),
+                publicMarketData = null,
+                marketHealthy = marketHealthy,
+            ),
+        )
+
+    internal fun processTimer(
+        symbol: String,
+        marketHealthy: Boolean,
+    ): Mono<Void> =
+        submitSymbolEvent(
+            symbol = symbol,
+            event = SymbolLevelEvent.Timer(
+                processedAt = clock.instant(),
+                publicMarketData = null,
+                marketHealthy = marketHealthy,
+            ),
+        )
+
+    internal fun processOrderEventPlaceholder(
+        symbol: String,
+        eventId: String,
+    ): Mono<Void> =
+        submitSymbolEvent(
+            symbol = symbol,
+            event = SymbolLevelEvent.OrderEventPlaceholder(
+                eventId = eventId,
+                processedAt = clock.instant(),
+            ),
+        )
 
     @PreDestroy
     fun close() {
-        val trackers = lock.withLock {
-            levels.values
-                .map(StoredLevel::signalTracker)
-                .also { levels.clear() }
+        val runtimes = lock.withLock {
+            symbolRuntimes.values.toList().also {
+                symbolRuntimes.clear()
+                levels.clear()
+            }
         }
         symbolConfigurationPermits.clear()
-        trackers.forEach(LevelSignalTracker::close)
-        signalScheduler.dispose()
+        runtimes.forEach(SymbolRuntime::close)
+        eventScheduler.dispose()
     }
+
+    private fun submitSymbolEvent(
+        symbol: String,
+        event: SymbolLevelEvent,
+    ): Mono<Void> {
+        val normalizedSymbol = symbol.trim().uppercase()
+        val runtime = lock.withLock {
+            symbolRuntimes[normalizedSymbol]?.also { it.pendingEvents += 1 }
+        } ?: return Mono.error(
+            levelError(
+                LevelReasonCode.LEVEL_NOT_FOUND,
+                "No levels exist for $normalizedSymbol",
+            ),
+        )
+        return submit(runtime, event).then()
+    }
+
+    private fun handleSymbolEvent(
+        symbol: String,
+        event: SymbolLevelEvent,
+    ): Any =
+        lock.withLock {
+            when (event) {
+                is SymbolLevelEvent.AddLevel -> addLevel(event)
+                is SymbolLevelEvent.DeleteLevel -> deleteLevel(event)
+                is SymbolLevelEvent.UpdateOwnership -> updateOwnership(event)
+                is SymbolLevelEvent.AggregateTrade -> {
+                    levelsForSymbol(symbol).forEach { stored ->
+                        stored.signalTracker.record(event.event)
+                        if (
+                            stored.snapshot.state == LevelState.WARMING_UP &&
+                            crossesLevel(stored, event.event.price)
+                        ) {
+                            transitionToMissed(stored, event.processedAt)
+                        } else {
+                            advanceWarmup(
+                                stored = stored,
+                                processedAt = event.processedAt,
+                                marketHealthy = event.marketHealthy,
+                            )
+                            enterApproachIfEligible(
+                                stored = stored,
+                                referencePrice = event.event.price,
+                                processedAt = event.processedAt,
+                                publicMarketData = event.publicMarketData,
+                            )
+                        }
+                        refreshSignal(stored, event.processedAt, event.publicMarketData)
+                    }
+                    Unit
+                }
+
+                is SymbolLevelEvent.BookTicker -> {
+                    val referencePrice = event.event.bidPrice
+                        .add(event.event.askPrice)
+                        .divide(TWO, CALCULATION_SCALE, RoundingMode.HALF_UP)
+                    levelsForSymbol(symbol).forEach { stored ->
+                        stored.signalTracker.record(event.event)
+                        advanceWarmup(
+                            stored = stored,
+                            processedAt = event.processedAt,
+                            marketHealthy = event.marketHealthy,
+                        )
+                        enterApproachIfEligible(
+                            stored = stored,
+                            referencePrice = referencePrice,
+                            processedAt = event.processedAt,
+                            publicMarketData = event.publicMarketData,
+                        )
+                        refreshSignal(stored, event.processedAt, event.publicMarketData)
+                    }
+                    Unit
+                }
+
+                is SymbolLevelEvent.Timer -> {
+                    levelsForSymbol(symbol).forEach { stored ->
+                        stored.signalTracker.tick(event.processedAt, stored.npuMode)
+                        advanceWarmup(
+                            stored = stored,
+                            processedAt = event.processedAt,
+                            marketHealthy = event.marketHealthy,
+                        )
+                        val referencePrice = stored.signalTracker.snapshot(
+                            publicMarketData = event.publicMarketData,
+                            privateStreamReadiness = BinanceReadiness.NOT_READY,
+                            hasUnresolvedOrder = stored.snapshot.hasUnresolvedOrder,
+                            now = event.processedAt,
+                        ).midPrice
+                        if (referencePrice != null) {
+                            enterApproachIfEligible(
+                                stored = stored,
+                                referencePrice = referencePrice,
+                                processedAt = event.processedAt,
+                                publicMarketData = event.publicMarketData,
+                            )
+                        }
+                        refreshSignal(stored, event.processedAt, event.publicMarketData)
+                    }
+                    Unit
+                }
+
+                is SymbolLevelEvent.OrderEventPlaceholder -> Unit
+            }
+        }
+
+    private fun addLevel(event: SymbolLevelEvent.AddLevel): LevelSnapshot {
+        checkCollectionConstraintsLocked(event.plan.key)
+        val tracker = LevelSignalTracker(
+            symbol = event.plan.input.symbol,
+            direction = event.plan.input.direction,
+            levelPrice = event.plan.sizing.normalizedLevelPrice,
+            tickSize = event.plan.tickSize,
+            clock = clock,
+        )
+        val initialSignal = tracker.snapshot(
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            hasUnresolvedOrder = false,
+            now = event.processedAt,
+        )
+        val snapshot = LevelSnapshot(
+            id = UUID.randomUUID(),
+            createdAt = event.processedAt,
+            symbol = event.plan.input.symbol,
+            direction = event.plan.input.direction,
+            requestedLevelPrice = event.plan.input.requestedLevelPrice,
+            normalizedLevelPrice = event.plan.sizing.normalizedLevelPrice,
+            positionNotionalUsdt = event.plan.input.positionNotionalUsdt,
+            maxImpulsePct = event.plan.input.maxImpulsePct,
+            sizingReferencePrice = event.plan.sizing.currentPrice,
+            plannedQuantity = event.plan.sizing.plannedQuantity,
+            entryAllocation = event.plan.sizing.allocation,
+            leverage = event.plan.leverage,
+            projectedIsolatedMargin = event.plan.projectedIsolatedMargin,
+            riskBoundaryStopPrice = event.plan.riskBoundaryStopPrice,
+            estimatedLiquidationPrice = event.plan.estimatedLiquidationPrice,
+            state = LevelState.WARMING_UP,
+            stateChangedAt = event.processedAt,
+            warmupHealthySince = if (event.marketHealthy) {
+                event.processedAt
+            } else {
+                null
+            },
+            terminalReason = null,
+            globalState = GlobalTradingState.RUNNING,
+            blockers = listOf(LevelBlocker.WARMING_UP),
+            signal = initialSignal,
+            ownsActiveAttempt = false,
+            ownsExposure = false,
+            hasUnresolvedOrder = false,
+            deleteAllowed = true,
+        )
+        val stored = StoredLevel(
+            key = event.plan.key,
+            snapshot = snapshot,
+            signalTracker = tracker,
+        )
+        levels[snapshot.id] = stored
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            globalState = GlobalTradingState.RUNNING,
+            now = event.processedAt,
+        ).also { stored.snapshot = it }
+    }
+
+    private fun deleteLevel(event: SymbolLevelEvent.DeleteLevel): LevelSnapshot {
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        when {
+            stored.snapshot.ownsExposure -> throw levelError(
+                LevelReasonCode.LEVEL_HAS_EXPOSURE,
+                "Level ${event.levelId} cannot be deleted while it owns exposure",
+            )
+
+            stored.snapshot.hasUnresolvedOrder -> throw levelError(
+                LevelReasonCode.LEVEL_HAS_UNRESOLVED_ORDER,
+                "Level ${event.levelId} cannot be deleted while it owns an unresolved order",
+            )
+        }
+        checkNotNull(levels.remove(event.levelId)) {
+            "Level ${event.levelId} disappeared from its ordered event queue"
+        }
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            globalState = GlobalTradingState.RUNNING,
+            now = event.processedAt,
+        )
+    }
+
+    private fun updateOwnership(
+        event: SymbolLevelEvent.UpdateOwnership,
+    ): LevelSnapshot {
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        val claimsOwnership =
+            event.ownsActiveAttempt ||
+                event.ownsExposure ||
+                event.hasUnresolvedOrder
+        val otherOwner = levels.values.firstOrNull { candidate ->
+            candidate.snapshot.symbol == stored.snapshot.symbol &&
+                candidate.snapshot.id != event.levelId &&
+                candidate.claimsSymbolOwnership()
+        }
+        if (claimsOwnership && otherOwner != null) {
+            throw levelError(
+                LevelReasonCode.SYMBOL_OWNERSHIP_CONFLICT,
+                "Level ${otherOwner.snapshot.id} already owns the active attempt for ${stored.snapshot.symbol}",
+            )
+        }
+        stored.snapshot = stored.snapshot.copy(
+            ownsActiveAttempt = event.ownsActiveAttempt,
+            ownsExposure = event.ownsExposure,
+            hasUnresolvedOrder = event.hasUnresolvedOrder,
+            deleteAllowed = !event.ownsExposure && !event.hasUnresolvedOrder,
+        )
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            globalState = GlobalTradingState.RUNNING,
+            now = event.processedAt,
+        ).also { stored.snapshot = it }
+    }
+
+    private fun advanceWarmup(
+        stored: StoredLevel,
+        processedAt: Instant,
+        marketHealthy: Boolean,
+    ) {
+        if (stored.snapshot.state != LevelState.WARMING_UP) {
+            return
+        }
+        if (!marketHealthy) {
+            stored.snapshot = stored.snapshot.copy(warmupHealthySince = null)
+            return
+        }
+        val healthySince = stored.snapshot.warmupHealthySince ?: processedAt
+        stored.snapshot = stored.snapshot.copy(warmupHealthySince = healthySince)
+        if (processedAt.isBefore(healthySince.plus(WARMUP_DURATION))) {
+            return
+        }
+        stored.npuMode = NpuMode.ARMED
+        stored.signalTracker.tick(processedAt, NpuMode.ARMED)
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.ARMED,
+            stateChangedAt = processedAt,
+            terminalReason = null,
+        )
+    }
+
+    private fun enterApproachIfEligible(
+        stored: StoredLevel,
+        referencePrice: BigDecimal,
+        processedAt: Instant,
+        publicMarketData: PublicMarketDataSnapshot?,
+    ) {
+        if (stored.snapshot.state != LevelState.ARMED) {
+            return
+        }
+        val npu = stored.signalTracker.snapshot(
+            publicMarketData = publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            hasUnresolvedOrder = stored.snapshot.hasUnresolvedOrder,
+            now = processedAt,
+        ).npu.absolute ?: return
+        val activationDistance = npu.multiply(ACTIVATION_NPU_MULTIPLIER)
+        if (
+            stored.snapshot.normalizedLevelPrice
+                .subtract(referencePrice)
+                .abs() > activationDistance
+        ) {
+            return
+        }
+        stored.npuMode = NpuMode.FROZEN
+        stored.signalTracker.tick(processedAt, NpuMode.FROZEN)
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.APPROACH,
+            stateChangedAt = processedAt,
+        )
+    }
+
+    private fun transitionToMissed(stored: StoredLevel, processedAt: Instant) {
+        stored.snapshot = stored.snapshot.copy(
+            state = LevelState.TERMINAL,
+            stateChangedAt = processedAt,
+            terminalReason = LevelReasonCode.MISSED_DURING_WARMUP,
+        )
+    }
+
+    private fun crossesLevel(stored: StoredLevel, tradePrice: BigDecimal): Boolean =
+        when (stored.snapshot.direction) {
+            LevelDirection.LONG ->
+                tradePrice >= stored.snapshot.normalizedLevelPrice
+
+            LevelDirection.SHORT ->
+                tradePrice <= stored.snapshot.normalizedLevelPrice
+        }
+
+    private fun refreshSignal(
+        stored: StoredLevel,
+        now: Instant,
+        publicMarketData: PublicMarketDataSnapshot?,
+    ) {
+        stored.snapshot = currentSnapshot(
+            stored = stored,
+            publicMarketData = publicMarketData,
+            privateStreamReadiness = BinanceReadiness.NOT_READY,
+            globalState = GlobalTradingState.RUNNING,
+            now = now,
+        )
+    }
+
+    private fun levelsForSymbol(symbol: String): List<StoredLevel> =
+        levels.values.filter { stored -> stored.snapshot.symbol == symbol }
 
     private fun validateInput(command: CreateLevelCommand): ValidatedInput {
         val symbol = command.symbol.trim().uppercase()
@@ -649,119 +1013,225 @@ class LevelService(
 
     private fun checkCollectionConstraints(key: LevelKey) {
         lock.withLock {
-            if (levels.values.any { stored -> stored.key == key }) {
-                throw levelError(
-                    LevelReasonCode.DUPLICATE_LEVEL,
-                    "An exact normalized level already exists",
-                )
-            }
-            if (levels.size >= MAX_LEVELS) {
-                throw levelError(
-                    LevelReasonCode.LEVEL_CAPACITY_REACHED,
-                    "At most $MAX_LEVELS levels may be stored",
-                )
-            }
+            checkCollectionConstraintsLocked(key)
         }
     }
 
-    private fun store(plan: LevelPlan): LevelSnapshot {
-        val marketDataSubscription = try {
-            publicMarketDataService.observe(plan.input.symbol)
-        } catch (error: RuntimeException) {
+    private fun checkCollectionConstraintsLocked(key: LevelKey) {
+        if (levels.values.any { stored -> stored.key == key }) {
             throw levelError(
-                LevelReasonCode.INVALID_LEVEL,
-                "Could not start public market data for ${plan.input.symbol}",
-                error,
+                LevelReasonCode.DUPLICATE_LEVEL,
+                "An exact normalized level already exists",
             )
         }
-        val signalTracker = try {
-            LevelSignalTracker(
-                symbol = plan.input.symbol,
-                direction = plan.input.direction,
-                levelPrice = plan.sizing.normalizedLevelPrice,
-                tickSize = plan.tickSize,
-                marketDataSubscription = marketDataSubscription,
-                clock = clock,
-                scheduler = signalScheduler,
-            )
-        } catch (error: RuntimeException) {
-            marketDataSubscription.close()
+        if (levels.size >= MAX_LEVELS) {
             throw levelError(
-                LevelReasonCode.INVALID_LEVEL,
-                "Could not start signal calculation for ${plan.input.symbol}",
-                error,
+                LevelReasonCode.LEVEL_CAPACITY_REACHED,
+                "At most $MAX_LEVELS levels may be stored",
             )
-        }
-        val initialPublicMarketData = publicMarketDataService
-            .snapshots()
-            .firstOrNull { snapshot -> snapshot.symbol == plan.input.symbol }
-        val initialSignal = signalTracker.snapshot(
-            publicMarketData = initialPublicMarketData,
-            privateStreamReadiness = BinanceReadiness.NOT_READY,
-            hasUnresolvedOrder = false,
-        )
-        try {
-            return lock.withLock {
-                if (levels.values.any { stored -> stored.key == plan.key }) {
-                    throw levelError(
-                        LevelReasonCode.DUPLICATE_LEVEL,
-                        "An exact normalized level already exists",
-                    )
-                }
-                if (levels.size >= MAX_LEVELS) {
-                    throw levelError(
-                        LevelReasonCode.LEVEL_CAPACITY_REACHED,
-                        "At most $MAX_LEVELS levels may be stored",
-                    )
-                }
-                val snapshot = LevelSnapshot(
-                    id = UUID.randomUUID(),
-                    createdAt = clock.instant(),
-                    symbol = plan.input.symbol,
-                    direction = plan.input.direction,
-                    requestedLevelPrice = plan.input.requestedLevelPrice,
-                    normalizedLevelPrice = plan.sizing.normalizedLevelPrice,
-                    positionNotionalUsdt = plan.input.positionNotionalUsdt,
-                    maxImpulsePct = plan.input.maxImpulsePct,
-                    sizingReferencePrice = plan.sizing.currentPrice,
-                    plannedQuantity = plan.sizing.plannedQuantity,
-                    entryAllocation = plan.sizing.allocation,
-                    leverage = plan.leverage,
-                    projectedIsolatedMargin = plan.projectedIsolatedMargin,
-                    riskBoundaryStopPrice = plan.riskBoundaryStopPrice,
-                    estimatedLiquidationPrice = plan.estimatedLiquidationPrice,
-                    state = LevelState.WARMING_UP,
-                    blockers = listOf(LevelBlocker.WARMING_UP),
-                    signal = initialSignal,
-                    ownsExposure = false,
-                    hasUnresolvedOrder = false,
-                    deleteAllowed = true,
-                )
-                levels[snapshot.id] = StoredLevel(
-                    key = plan.key,
-                    snapshot = snapshot,
-                    signalTracker = signalTracker,
-                )
-                snapshot
-            }
-        } catch (error: RuntimeException) {
-            signalTracker.close()
-            throw error
         }
     }
+
+    private fun store(plan: LevelPlan): Mono<LevelSnapshot> {
+        val runtime = try {
+            reserveSymbolRuntime(plan.input.symbol)
+        } catch (error: RuntimeException) {
+            return Mono.error(
+                levelError(
+                    LevelReasonCode.INVALID_LEVEL,
+                    "Could not start ordered market processing for ${plan.input.symbol}",
+                    error,
+                ),
+            )
+        }
+        val publicMarketData = currentPublicMarketData(plan.input.symbol)
+        return submit(
+            runtime,
+            SymbolLevelEvent.AddLevel(
+                plan = plan,
+                processedAt = clock.instant(),
+                publicMarketData = publicMarketData,
+                marketHealthy = publicMarketData?.healthy == true,
+            ),
+        )
+            .map { result -> result as LevelSnapshot }
+    }
+
+    private fun reserveSymbolRuntime(symbol: String): SymbolRuntime {
+        var created = false
+        val runtime = lock.withLock {
+            val selected = symbolRuntimes[symbol] ?: run {
+                val marketDataSubscription = publicMarketDataService.observe(symbol)
+                val queue = OrderedSymbolEventQueue<SymbolLevelEvent>(
+                    symbol = symbol,
+                    scheduler = eventScheduler,
+                    handler = { event -> handleSymbolEvent(symbol, event) },
+                )
+                SymbolRuntime(
+                    symbol = symbol,
+                    queue = queue,
+                    marketDataSubscription = marketDataSubscription,
+                ).also {
+                    symbolRuntimes[symbol] = it
+                    created = true
+                }
+            }
+            selected.pendingEvents += 1
+            selected
+        }
+        if (created) {
+            try {
+                startRuntime(runtime)
+            } catch (error: RuntimeException) {
+                releasePendingEvent(runtime)
+                throw error
+            }
+        }
+        return runtime
+    }
+
+    private fun startRuntime(runtime: SymbolRuntime) {
+        runtime.subscriptions += runtime.marketDataSubscription.aggregateTrades
+            .onErrorComplete()
+            .subscribe { event ->
+                val marketData = currentPublicMarketData(runtime.symbol)
+                runtime.queue.publish(
+                    SymbolLevelEvent.AggregateTrade(
+                        event = event,
+                        processedAt = clock.instant(),
+                        publicMarketData = marketData,
+                        marketHealthy = marketData?.healthy == true,
+                    ),
+                )
+            }
+        runtime.subscriptions += runtime.marketDataSubscription.bookTickers
+            .onErrorComplete()
+            .subscribe { event ->
+                val marketData = currentPublicMarketData(runtime.symbol)
+                runtime.queue.publish(
+                    SymbolLevelEvent.BookTicker(
+                        event = event,
+                        processedAt = clock.instant(),
+                        publicMarketData = marketData,
+                        marketHealthy = marketData?.healthy == true,
+                    ),
+                )
+            }
+        if (automaticTimers) {
+            runtime.subscriptions += Flux
+                .interval(EVENT_SAMPLE_INTERVAL, EVENT_SAMPLE_INTERVAL, eventScheduler)
+                .subscribe {
+                    val marketData = currentPublicMarketData(runtime.symbol)
+                    runtime.queue.publish(
+                        SymbolLevelEvent.Timer(
+                            processedAt = clock.instant(),
+                            publicMarketData = marketData,
+                            marketHealthy = marketData?.healthy == true,
+                        ),
+                    )
+                }
+        }
+    }
+
+    private fun closeRuntimeWhenUnused(symbol: String) {
+        val runtime = lock.withLock {
+            val current = symbolRuntimes[symbol]
+            if (
+                current == null ||
+                current.pendingEvents > 0 ||
+                levels.values.any { stored -> stored.snapshot.symbol == symbol }
+            ) {
+                null
+            } else {
+                symbolRuntimes.remove(symbol)
+            }
+        }
+        runtime?.close()
+    }
+
+    private fun submit(
+        runtime: SymbolRuntime,
+        event: SymbolLevelEvent,
+    ): Mono<Any> =
+        try {
+            runtime.queue.submit(
+                event = event,
+                afterProcessed = { releasePendingEvent(runtime) },
+            )
+        } catch (error: RuntimeException) {
+            releasePendingEvent(runtime)
+            Mono.error(error)
+        }
+
+    private fun releasePendingEvent(runtime: SymbolRuntime) {
+        lock.withLock {
+            check(runtime.pendingEvents > 0) {
+                "No pending event exists for ${runtime.symbol}"
+            }
+            runtime.pendingEvents -= 1
+        }
+        closeRuntimeWhenUnused(runtime.symbol)
+    }
+
+    private fun publicMarketData(levelId: UUID): PublicMarketDataSnapshot? {
+        val symbol = lock.withLock { levels[levelId]?.snapshot?.symbol }
+            ?: return null
+        return currentPublicMarketData(symbol)
+    }
+
+    private fun currentPublicMarketData(symbol: String): PublicMarketDataSnapshot? =
+        publicMarketDataService
+            .snapshots()
+            .firstOrNull { snapshot -> snapshot.symbol == symbol }
 
     private fun currentSnapshot(
         stored: StoredLevel,
         publicMarketData: PublicMarketDataSnapshot?,
         privateStreamReadiness: BinanceReadiness,
+        globalState: GlobalTradingState,
+        now: Instant = clock.instant(),
     ): LevelSnapshot =
         stored.snapshot.copy(
+            globalState = globalState,
+            blockers = blockers(stored, globalState),
             signal = stored.signalTracker.snapshot(
                 publicMarketData = publicMarketData,
                 privateStreamReadiness = privateStreamReadiness,
                 hasUnresolvedOrder = stored.snapshot.hasUnresolvedOrder,
+                now = now,
             ),
         )
+
+    private fun blockers(
+        stored: StoredLevel,
+        globalState: GlobalTradingState,
+    ): List<LevelBlocker> =
+        buildList {
+            when (stored.snapshot.state) {
+                LevelState.WARMING_UP -> add(LevelBlocker.WARMING_UP)
+                LevelState.TERMINAL -> add(LevelBlocker.TERMINAL)
+                LevelState.ARMED,
+                LevelState.APPROACH,
+                -> Unit
+            }
+            when (globalState) {
+                GlobalTradingState.RUNNING -> Unit
+                GlobalTradingState.ENTRY_COOLDOWN ->
+                    add(LevelBlocker.ENTRY_COOLDOWN)
+
+                GlobalTradingState.SAFE_MODE -> add(LevelBlocker.SAFE_MODE)
+                GlobalTradingState.DAILY_LOCKED -> add(LevelBlocker.DAILY_LOCKED)
+                GlobalTradingState.MANUAL_LOCK -> add(LevelBlocker.MANUAL_LOCK)
+            }
+            val anotherOwner = levels.values.any { candidate ->
+                candidate.snapshot.symbol == stored.snapshot.symbol &&
+                    candidate.snapshot.id != stored.snapshot.id &&
+                    candidate.claimsSymbolOwnership()
+            }
+            if (!stored.claimsSymbolOwnership() && anotherOwner) {
+                add(LevelBlocker.SYMBOL_HAS_ACTIVE_OWNER)
+            }
+        }
 
     private fun roundToIncrement(
         value: BigDecimal,
@@ -791,12 +1261,28 @@ private data class StoredLevel(
     val key: LevelKey,
     var snapshot: LevelSnapshot,
     val signalTracker: LevelSignalTracker,
-)
+    var npuMode: NpuMode = NpuMode.WARMING_UP,
+) {
+    fun claimsSymbolOwnership(): Boolean =
+        snapshot.ownsActiveAttempt ||
+            snapshot.ownsExposure ||
+            snapshot.hasUnresolvedOrder
+}
 
-private data class UpdatedStoredLevel(
-    val stored: StoredLevel,
-    val snapshot: LevelSnapshot,
-)
+private data class SymbolRuntime(
+    val symbol: String,
+    val queue: OrderedSymbolEventQueue<SymbolLevelEvent>,
+    val marketDataSubscription: PublicMarketDataSubscription,
+    val subscriptions: MutableList<Disposable> = mutableListOf(),
+    var pendingEvents: Int = 0,
+) : AutoCloseable {
+    override fun close() {
+        subscriptions.forEach(Disposable::dispose)
+        subscriptions.clear()
+        queue.close()
+        marketDataSubscription.close()
+    }
+}
 
 private data class ValidatedInput(
     val symbol: String,
@@ -838,6 +1324,55 @@ private data class LevelKey(
     val normalizedLevelPrice: BigDecimal,
 )
 
+private sealed interface SymbolLevelEvent {
+    data class AddLevel(
+        val plan: LevelPlan,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+        val marketHealthy: Boolean,
+    ) : SymbolLevelEvent
+
+    data class DeleteLevel(
+        val levelId: UUID,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class UpdateOwnership(
+        val levelId: UUID,
+        val ownsActiveAttempt: Boolean,
+        val ownsExposure: Boolean,
+        val hasUnresolvedOrder: Boolean,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class AggregateTrade(
+        val event: AggregateTradeEvent,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+        val marketHealthy: Boolean,
+    ) : SymbolLevelEvent
+
+    data class BookTicker(
+        val event: BookTickerEvent,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+        val marketHealthy: Boolean,
+    ) : SymbolLevelEvent
+
+    data class Timer(
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+        val marketHealthy: Boolean,
+    ) : SymbolLevelEvent
+
+    data class OrderEventPlaceholder(
+        val eventId: String,
+        val processedAt: Instant,
+    ) : SymbolLevelEvent
+}
+
 private fun levelError(
     code: LevelReasonCode,
     message: String,
@@ -850,5 +1385,9 @@ private const val USDT_ASSET = "USDT"
 private const val MAX_LEVELS = 100
 private const val MAX_LEVERAGE = 20
 private const val CALCULATION_SCALE = 16
+private val EVENT_SAMPLE_INTERVAL: Duration = Duration.ofMillis(100)
+private val WARMUP_DURATION: Duration = Duration.ofSeconds(10)
+private val ACTIVATION_NPU_MULTIPLIER = BigDecimal("8")
+private val TWO = BigDecimal("2")
 private val THIRTY_PERCENT = BigDecimal("0.30")
 private val ONE_PERCENT = BigDecimal("0.01")

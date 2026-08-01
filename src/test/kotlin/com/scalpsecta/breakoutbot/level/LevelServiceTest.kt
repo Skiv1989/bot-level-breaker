@@ -15,10 +15,10 @@ import com.scalpsecta.breakoutbot.binance.BinanceSymbolConfiguration
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolLeverageBrackets
 import com.scalpsecta.breakoutbot.binance.BinanceSymbolMetadata
 import com.scalpsecta.breakoutbot.marketdata.AggregateTradeEvent
+import com.scalpsecta.breakoutbot.marketdata.AggressorSide
 import com.scalpsecta.breakoutbot.marketdata.BookTickerEvent
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataService
 import com.scalpsecta.breakoutbot.marketdata.PublicMarketDataStreamProvider
-import com.scalpsecta.breakoutbot.signal.NpuMode
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowableOfType
 import org.junit.jupiter.api.AfterEach
@@ -27,20 +27,25 @@ import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
+import java.util.concurrent.atomic.AtomicReference
 
 class LevelServiceTest {
     private val now = Instant.parse("2026-07-31T12:00:00Z")
+    private val clock = LevelMutableClock(now)
     private val client = LevelTestBinanceClient(now)
     private val marketDataService = PublicMarketDataService(
         streamProvider = EmptyMarketDataStreamProvider,
-        clock = Clock.fixed(now, ZoneOffset.UTC),
+        clock = clock,
     )
     private val service = LevelService(
         client = client,
         publicMarketDataService = marketDataService,
-        clock = Clock.fixed(now, ZoneOffset.UTC),
+        clock = clock,
+        automaticTimers = false,
     )
 
     @AfterEach
@@ -240,8 +245,8 @@ class LevelServiceTest {
             levelId = created.id,
             ownsExposure = true,
             hasUnresolvedOrder = false,
-        )
-        val exposureFailure = levelFailure { service.delete(created.id) }
+        ).block()
+        val exposureFailure = levelFailure { service.delete(created.id).block() }
         assertThat(exposureFailure.code)
             .isEqualTo(LevelReasonCode.LEVEL_HAS_EXPOSURE)
 
@@ -249,8 +254,8 @@ class LevelServiceTest {
             levelId = created.id,
             ownsExposure = false,
             hasUnresolvedOrder = true,
-        )
-        val orderFailure = levelFailure { service.delete(created.id) }
+        ).block()
+        val orderFailure = levelFailure { service.delete(created.id).block() }
         assertThat(orderFailure.code)
             .isEqualTo(LevelReasonCode.LEVEL_HAS_UNRESOLVED_ORDER)
 
@@ -258,26 +263,227 @@ class LevelServiceTest {
             levelId = created.id,
             ownsExposure = false,
             hasUnresolvedOrder = false,
-        )
-        assertThat(service.delete(created.id).id).isEqualTo(created.id)
+        ).block()
+        assertThat(service.delete(created.id).block()!!.id).isEqualTo(created.id)
         assertThat(service.currentState()).isEmpty()
         assertThat(marketDataService.activeSymbolCount()).isZero()
     }
 
     @Test
-    fun `signal NPU mode recomputes when armed and freezes on approach`() {
+    fun `signal NPU is computed when armed and freezes on approach`() {
         val created = service.create(command()).block()!!
 
-        val armed = service.updateSignalNpuMode(created.id, NpuMode.ARMED)
+        service.process(bookTicker("90"), marketHealthy = true).block()
+        clock.advance(Duration.ofSeconds(10))
+        service.process(bookTicker("90"), marketHealthy = true).block()
+
+        val armed = service.currentState().single()
+        assertThat(armed.state).isEqualTo(LevelState.ARMED)
         assertThat(armed.signal.npu.absolute)
             .isEqualByComparingTo(BigDecimal("0.1"))
         assertThat(armed.signal.npu.frozen).isFalse()
 
-        val approach = service.updateSignalNpuMode(created.id, NpuMode.FROZEN)
+        service.process(bookTicker("100.5"), marketHealthy = true).block()
+
+        val approach = service.currentState().single()
+        assertThat(approach.id).isEqualTo(created.id)
+        assertThat(approach.state).isEqualTo(LevelState.APPROACH)
         assertThat(approach.signal.npu.absolute)
             .isEqualByComparingTo(BigDecimal("0.1"))
         assertThat(approach.signal.npu.frozen).isTrue()
     }
+
+    @Test
+    fun `warmup needs ten continuous healthy seconds`() {
+        service.create(command()).block()
+        service.process(bookTicker("90"), marketHealthy = true).block()
+
+        clock.advance(Duration.ofSeconds(9))
+        service.processTimer("BTCUSDT", marketHealthy = true).block()
+        assertThat(service.currentState().single().state)
+            .isEqualTo(LevelState.WARMING_UP)
+
+        service.processTimer("BTCUSDT", marketHealthy = false).block()
+        service.processTimer("BTCUSDT", marketHealthy = true).block()
+        clock.advance(Duration.ofSeconds(9).plusMillis(999))
+        service.processTimer("BTCUSDT", marketHealthy = true).block()
+        assertThat(service.currentState().single().state)
+            .isEqualTo(LevelState.WARMING_UP)
+
+        clock.advance(Duration.ofMillis(1))
+        service.processTimer("BTCUSDT", marketHealthy = true).block()
+
+        val armed = service.currentState().single()
+        assertThat(armed.state).isEqualTo(LevelState.ARMED)
+        assertThat(armed.warmupHealthySince)
+            .isEqualTo(clock.instant().minusSeconds(10))
+        assertThat(armed.blockers).doesNotContain(LevelBlocker.WARMING_UP)
+    }
+
+    @Test
+    fun `bid ask cannot cross but aggregate trades mirror warmup crossing`() {
+        val long = service.create(command(levelPrice = "101.2")).block()!!
+        val short = service.create(
+            command(
+                direction = LevelDirection.SHORT,
+                levelPrice = "98.8",
+            ),
+        ).block()!!
+
+        service.process(bookTicker("102"), marketHealthy = true).block()
+        assertThat(service.currentState().map(LevelSnapshot::state))
+            .containsOnly(LevelState.WARMING_UP)
+
+        service.process(trade("101.2"), marketHealthy = true).block()
+        service.process(trade("98.8"), marketHealthy = true).block()
+
+        val levels = service.currentState().associateBy(LevelSnapshot::id)
+        assertThat(levels.getValue(long.id).state).isEqualTo(LevelState.TERMINAL)
+        assertThat(levels.getValue(short.id).state).isEqualTo(LevelState.TERMINAL)
+        assertThat(levels.getValue(long.id).terminalReason)
+            .isEqualTo(LevelReasonCode.MISSED_DURING_WARMUP)
+        assertThat(levels.getValue(short.id).terminalReason)
+            .isEqualTo(LevelReasonCode.MISSED_DURING_WARMUP)
+        assertThat(levels.values.flatMap(LevelSnapshot::blockers))
+            .containsOnly(LevelBlocker.TERMINAL)
+    }
+
+    @Test
+    fun `activation band is mirrored and freezes NPU for both directions`() {
+        val long = service.create(command(levelPrice = "101.2")).block()!!
+        val short = service.create(
+            command(
+                direction = LevelDirection.SHORT,
+                levelPrice = "98.8",
+            ),
+        ).block()!!
+        service.process(bookTicker("100"), marketHealthy = true).block()
+        clock.advance(Duration.ofSeconds(10))
+        service.processTimer("BTCUSDT", marketHealthy = true).block()
+        assertThat(service.currentState().map(LevelSnapshot::state))
+            .containsOnly(LevelState.ARMED)
+
+        service.process(bookTicker("100.5"), marketHealthy = true).block()
+        service.process(bookTicker("99.5"), marketHealthy = true).block()
+
+        val levels = service.currentState().associateBy(LevelSnapshot::id)
+        assertThat(levels.getValue(long.id).state).isEqualTo(LevelState.APPROACH)
+        assertThat(levels.getValue(short.id).state).isEqualTo(LevelState.APPROACH)
+        assertThat(levels.values.map { level -> level.signal.npu.frozen })
+            .containsOnly(true)
+        assertThat(levels.values.mapNotNull { level -> level.signal.npu.absolute })
+            .usingElementComparator(BigDecimal::compareTo)
+            .containsOnly(BigDecimal("0.1"))
+    }
+
+    @Test
+    fun `same-symbol event order advances one level while missing another`() {
+        val nearer = service.create(command(levelPrice = "101.2")).block()!!
+        val farther = service.create(command(levelPrice = "102.2")).block()!!
+        service.process(bookTicker("90"), marketHealthy = true).block()
+        clock.advance(Duration.ofSeconds(10))
+
+        service.process(trade("101.2"), marketHealthy = true).block()
+        service.processTimer("BTCUSDT", marketHealthy = true).block()
+
+        val levels = service.currentState().associateBy(LevelSnapshot::id)
+        assertThat(levels.getValue(nearer.id).state)
+            .isEqualTo(LevelState.TERMINAL)
+        assertThat(levels.getValue(farther.id).state)
+            .isEqualTo(LevelState.ARMED)
+    }
+
+    @Test
+    fun `one same-symbol level can own the active attempt or position`() {
+        val first = service.create(command(levelPrice = "101.2")).block()!!
+        val second = service.create(command(levelPrice = "102.2")).block()!!
+
+        service.recordOwnership(
+            levelId = first.id,
+            ownsActiveAttempt = true,
+            ownsExposure = false,
+            hasUnresolvedOrder = false,
+        ).block()
+        service.processOrderEventPlaceholder("BTCUSDT", "order-1").block()
+
+        val conflict = levelFailure {
+            service.recordOwnership(
+                levelId = second.id,
+                ownsActiveAttempt = true,
+                ownsExposure = false,
+                hasUnresolvedOrder = false,
+            ).block()
+        }
+        assertThat(conflict.code)
+            .isEqualTo(LevelReasonCode.SYMBOL_OWNERSHIP_CONFLICT)
+        assertThat(
+            service.currentState().single { level -> level.id == second.id }.blockers,
+        ).contains(LevelBlocker.SYMBOL_HAS_ACTIVE_OWNER)
+
+        service.recordOwnership(
+            levelId = first.id,
+            ownsActiveAttempt = false,
+            ownsExposure = false,
+            hasUnresolvedOrder = false,
+        ).block()
+        val owner = service.recordOwnership(
+            levelId = second.id,
+            ownsExposure = true,
+            hasUnresolvedOrder = false,
+        ).block()!!
+        assertThat(owner.ownsExposure).isTrue()
+        assertThat(owner.deleteAllowed).isFalse()
+    }
+
+    @Test
+    fun `every global state is represented by affected level snapshots`() {
+        service.create(command()).block()
+
+        assertThat(
+            service.currentState(globalState = GlobalTradingState.RUNNING)
+                .single().globalState,
+        ).isEqualTo(GlobalTradingState.RUNNING)
+
+        val blockingStates = mapOf(
+            GlobalTradingState.ENTRY_COOLDOWN to LevelBlocker.ENTRY_COOLDOWN,
+            GlobalTradingState.SAFE_MODE to LevelBlocker.SAFE_MODE,
+            GlobalTradingState.DAILY_LOCKED to LevelBlocker.DAILY_LOCKED,
+            GlobalTradingState.MANUAL_LOCK to LevelBlocker.MANUAL_LOCK,
+        )
+        blockingStates.forEach { (globalState, blocker) ->
+            val snapshot = service.currentState(globalState = globalState).single()
+            assertThat(snapshot.globalState).isEqualTo(globalState)
+            assertThat(snapshot.blockers).contains(blocker)
+        }
+    }
+
+    private fun bookTicker(midPrice: String): BookTickerEvent {
+        val mid = BigDecimal(midPrice)
+        return BookTickerEvent(
+            symbol = "BTCUSDT",
+            updateId = clock.instant().toEpochMilli(),
+            eventTime = clock.instant(),
+            transactionTime = clock.instant(),
+            bidPrice = mid.subtract(BigDecimal("0.01")),
+            bidQuantity = BigDecimal.ONE,
+            askPrice = mid.add(BigDecimal("0.01")),
+            askQuantity = BigDecimal.ONE,
+            receivedAt = clock.instant(),
+        )
+    }
+
+    private fun trade(price: String): AggregateTradeEvent =
+        AggregateTradeEvent(
+            symbol = "BTCUSDT",
+            aggregateTradeId = clock.instant().toEpochMilli(),
+            eventTime = clock.instant(),
+            tradeTime = clock.instant(),
+            price = BigDecimal(price),
+            quantity = BigDecimal.ONE,
+            buyerIsMaker = false,
+            aggressorSide = AggressorSide.BUY,
+            receivedAt = clock.instant(),
+        )
 
     private fun command(
         symbol: String = "BTCUSDT",
@@ -303,6 +509,22 @@ private object EmptyMarketDataStreamProvider : PublicMarketDataStreamProvider {
         Flux.never()
 
     override fun bookTickers(symbol: String): Flux<BookTickerEvent> = Flux.never()
+}
+
+private class LevelMutableClock(
+    initialInstant: Instant,
+) : Clock() {
+    private val currentInstant = AtomicReference(initialInstant)
+
+    override fun getZone(): ZoneId = ZoneOffset.UTC
+
+    override fun withZone(zone: ZoneId): Clock = this
+
+    override fun instant(): Instant = currentInstant.get()
+
+    fun advance(duration: Duration) {
+        currentInstant.updateAndGet { instant -> instant.plus(duration) }
+    }
 }
 
 private class LevelTestBinanceClient(
