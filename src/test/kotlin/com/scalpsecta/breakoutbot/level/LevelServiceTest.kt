@@ -624,6 +624,36 @@ class LevelServiceTest {
             assertThat(protected.hardStopPrice).isEqualByComparingTo("99.7")
             assertThat(protected.hardStopConfirmedAt).isEqualTo(clock.instant())
             assertThat(protected.hasUnresolvedOrder).isFalse()
+
+            readyService.terminatePosition(
+                levelId = created.id,
+                reason = LevelReasonCode.HARD_STOP_FILLED,
+                confirmedRemainingQuantity = BigDecimal.ZERO,
+                hasUnresolvedOrder = false,
+                netResult = PositionNetResult(
+                    grossPnl = BigDecimal("-1"),
+                    fees = BigDecimal("0.1"),
+                    funding = BigDecimal.ZERO,
+                    slippage = BigDecimal("0.2"),
+                    netPnl = BigDecimal("-1.1"),
+                ),
+            ).block()
+            val other = readyService.create(
+                command(levelPrice = "102"),
+            ).block()!!
+            val duringCooldown = readyService.currentState()
+                .single { level -> level.id == other.id }
+            assertThat(duringCooldown.blockers)
+                .contains(LevelBlocker.SYMBOL_COOLDOWN)
+            assertThat(duringCooldown.symbolCooldownUntil)
+                .isEqualTo(clock.instant().plusSeconds(30))
+
+            clock.advance(Duration.ofSeconds(30))
+            val afterCooldown = readyService.currentState()
+                .single { level -> level.id == other.id }
+            assertThat(afterCooldown.blockers)
+                .doesNotContain(LevelBlocker.SYMBOL_COOLDOWN)
+            assertThat(afterCooldown.symbolCooldownUntil).isNull()
         } finally {
             readyService.close()
         }

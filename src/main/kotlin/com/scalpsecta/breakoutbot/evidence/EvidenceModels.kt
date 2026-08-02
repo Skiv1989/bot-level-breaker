@@ -237,4 +237,17 @@ internal fun LevelSnapshot.decisionEvidence(
             stopPrice = riskBoundaryStopPrice,
         ),
         quantity = QuantityEvidence(plannedQuantity = plannedQuantity),
+        pnl = netResult?.let { result ->
+            PnlEvidence(
+                grossPnl = result.grossPnl,
+                fees = result.fees,
+                funding = result.funding,
+                slippage = result.slippage,
+                netPnl = result.netPnl,
+            )
+        },
+        exit = ExitEvidence(
+            exitScore = exitScore.toBigDecimal(),
+            activePointReasons = activeExitPointReasons.map(Enum<*>::name),
+        ),
     )

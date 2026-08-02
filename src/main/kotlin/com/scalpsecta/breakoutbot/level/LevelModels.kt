@@ -57,6 +57,29 @@ data class LevelSnapshot(
     val crossedAt: Instant? = null,
     val confirmationStartedAt: Instant? = null,
     val breakoutConfirmedAt: Instant? = null,
+    val maximumHoldingDeadline: Instant? = null,
+    val exitScore: Int = 0,
+    val activeExitPointReasons: List<ExitPointReason> = emptyList(),
+    val symbolCooldownUntil: Instant? = null,
+    val netResult: PositionNetResult? = null,
+)
+
+enum class ExitPointReason(
+    val points: Int,
+) {
+    DIRECTIONAL_ABSORPTION(2),
+    OPPOSITE_AVERAGE_TRADE_SIZE(1),
+    PERSISTENT_OPPOSITE_DELTA(2),
+    PRICE_BEHIND_LEVEL(2),
+    HIGH_ACTIVITY_LOW_PROGRESS(1),
+}
+
+data class PositionNetResult(
+    val grossPnl: BigDecimal? = null,
+    val fees: BigDecimal? = null,
+    val funding: BigDecimal? = null,
+    val slippage: BigDecimal? = null,
+    val netPnl: BigDecimal? = null,
 )
 
 data class LevelEntryTranche(
@@ -89,6 +112,7 @@ enum class LevelBlocker {
     WARMING_UP,
     TERMINAL,
     ENTRY_COOLDOWN,
+    SYMBOL_COOLDOWN,
     SAFE_MODE,
     DAILY_LOCKED,
     MANUAL_LOCK,
@@ -128,6 +152,10 @@ enum class LevelReasonCode {
     PRIVATE_STREAM_FAILURE,
     ORDER_OUTCOME_UNKNOWN,
     TP_SETUP_FAILED,
+    EXIT_SCORE,
+    SNAPBACK,
+    MAX_HOLD_TIME,
+    HARD_STOP_FILLED,
     TAKE_PROFITS_COMPLETE,
 }
 

@@ -20,6 +20,7 @@ class BreakoutExecutionService internal constructor(
     private val orderExecutor: BreakoutOrderExecutor,
     automaticDispatch: Boolean,
     private val takeProfitSetupTimeout: Duration = Duration.ofSeconds(3),
+    private val normalExitWait: Duration = Duration.ofMillis(500),
 ) {
     @Autowired
     constructor(
@@ -28,12 +29,15 @@ class BreakoutExecutionService internal constructor(
         orderExecutor: BreakoutOrderExecutor,
         @Value("\${bot.execution.take-profit-setup-timeout:3s}")
         takeProfitSetupTimeout: Duration,
+        @Value("\${bot.execution.normal-exit-wait:500ms}")
+        normalExitWait: Duration,
     ) : this(
         levelCoordinator = levelCoordinator,
         riskService = riskService,
         orderExecutor = orderExecutor,
         automaticDispatch = true,
         takeProfitSetupTimeout = takeProfitSetupTimeout,
+        normalExitWait = normalExitWait,
     )
 
     init {
@@ -42,6 +46,13 @@ class BreakoutExecutionService internal constructor(
                 !takeProfitSetupTimeout.isNegative,
         ) {
             "takeProfitSetupTimeout must be positive"
+        }
+        require(
+            !normalExitWait.isZero &&
+                !normalExitWait.isNegative &&
+                normalExitWait <= MAXIMUM_NORMAL_EXIT_WAIT,
+        ) {
+            "normalExitWait must be positive and at most 500 ms"
         }
     }
 
@@ -58,10 +69,10 @@ class BreakoutExecutionService internal constructor(
     } else {
         null
     }
-    private val takeProfitFillSubscription: Disposable = orderExecutor
-        .takeProfitFills()
-        .concatMap { fill ->
-            recordTakeProfitFill(fill).onErrorResume { Mono.empty() }
+    private val positionReductionSubscription: Disposable = orderExecutor
+        .positionReductions()
+        .concatMap { reduction ->
+            recordPositionReduction(reduction).onErrorResume { Mono.empty() }
         }
         .subscribe()
 
@@ -77,7 +88,7 @@ class BreakoutExecutionService internal constructor(
     @PreDestroy
     fun close() {
         automaticSubscription?.dispose()
-        takeProfitFillSubscription.dispose()
+        positionReductionSubscription.dispose()
     }
 
     private fun executeAddition(
@@ -117,11 +128,12 @@ class BreakoutExecutionService internal constructor(
                 when {
                     resolution.outcome == OrderOutcome.UNKNOWN ->
                         levelCoordinator
-                            .terminate(
+                            .terminatePosition(
                                 levelId = request.levelId,
                                 reason = LevelReasonCode.ORDER_OUTCOME_UNKNOWN,
                                 confirmedRemainingQuantity = confirmedQuantity,
                                 hasUnresolvedOrder = true,
+                                netResult = null,
                             )
                             .thenReturn(
                                 terminatedResult(
@@ -275,37 +287,55 @@ class BreakoutExecutionService internal constructor(
             }
     }
 
-    private fun recordTakeProfitFill(
-        fill: TakeProfitFill,
+    private fun recordPositionReduction(
+        reduction: PositionReduction,
     ): Mono<Void> = Mono.defer {
         val attempt = riskService
             .currentState()
             .attempts
-            .firstOrNull { candidate -> candidate.levelId == fill.levelId }
+            .firstOrNull { candidate -> candidate.levelId == reduction.levelId }
             ?: return@defer Mono.empty()
         if (
-            fill.confirmedRemainingQuantity >=
+            reduction.confirmedRemainingQuantity >=
             attempt.confirmedPositionQuantity
         ) {
             return@defer Mono.empty()
         }
-        val riskUpdate = if (fill.confirmedRemainingQuantity.signum() == 0) {
-            riskService.recordConfirmedFlat(fill.levelId)
+        val riskUpdate = if (reduction.confirmedRemainingQuantity.signum() == 0) {
+            riskService.recordConfirmedFlat(reduction.levelId)
         } else {
             riskService.recordConfirmedReducingFill(
-                levelId = fill.levelId,
+                levelId = reduction.levelId,
                 confirmedRemainingQuantity =
-                    fill.confirmedRemainingQuantity,
+                    reduction.confirmedRemainingQuantity,
             )
+        }
+        val cancelOtherProtection = if (
+            reduction.confirmedRemainingQuantity.signum() == 0
+        ) {
+            when (reduction.role) {
+                OrderRole.HARD_STOP ->
+                    orderExecutor.cancelActiveTakeProfits(reduction.levelId)
+
+                OrderRole.TAKE_PROFIT ->
+                    orderExecutor.cancelActiveHardStop(reduction.levelId)
+
+                else -> Mono.just(true)
+            }.then()
+        } else {
+            Mono.empty()
         }
         riskUpdate
             .then(
-                levelCoordinator.recordTakeProfitFill(
-                    levelId = fill.levelId,
+                levelCoordinator.recordPositionReduction(
+                    levelId = reduction.levelId,
                     confirmedRemainingQuantity =
-                        fill.confirmedRemainingQuantity,
+                        reduction.confirmedRemainingQuantity,
+                    terminalReason = reduction.terminalReason,
+                    netResult = reduction.netResult,
                 ),
             )
+            .then(cancelOtherProtection)
     }
 
     private fun synchronizeRiskPosition(
@@ -379,40 +409,117 @@ class BreakoutExecutionService internal constructor(
         confirmedPositionAmount: BigDecimal = request.signedPositionAmount(),
         additionResolution: OrderResolution? = null,
         persistentUnresolvedOrder: Boolean = false,
+    ): Mono<BreakoutResult> =
+        if (
+            request is BreakoutExitRequest &&
+            reason in SOFT_EXIT_REASONS &&
+            request.softCloseIntent(confirmedPositionAmount) != null
+        ) {
+            closeExposureNormally(
+                request = request,
+                reason = reason,
+                confirmedPositionAmount = confirmedPositionAmount,
+            )
+        } else {
+            closeExposureWithMarket(
+                request = request,
+                reason = reason,
+                confirmedPositionAmount = confirmedPositionAmount,
+                additionResolution = additionResolution,
+                persistentUnresolvedOrder = persistentUnresolvedOrder,
+            )
+        }
+
+    private fun closeExposureNormally(
+        request: BreakoutExitRequest,
+        reason: LevelReasonCode,
+        confirmedPositionAmount: BigDecimal,
     ): Mono<BreakoutResult> {
         val confirmedQuantity = confirmedPositionAmount.abs()
-        val terminal = levelCoordinator.terminate(
-            levelId = request.levelId,
-            reason = reason,
-            confirmedRemainingQuantity = confirmedQuantity,
-            hasUnresolvedOrder = persistentUnresolvedOrder,
-        )
         if (confirmedQuantity.signum() == 0) {
-            return terminal
-                .then(riskService.recordConfirmedFlat(request.levelId))
-                .thenReturn(
-                    terminatedResult(
-                        request = request,
-                        resolution = additionResolution,
-                        reason = reason,
-                    ),
-                )
+            return finalizeClose(
+                request = request,
+                reason = reason,
+                remainingQuantity = BigDecimal.ZERO,
+                hasUnresolvedOrder = false,
+            )
         }
-        return terminal
-            .then(
-                orderExecutor.execute(
-                    OrderIntentRequest(
-                        levelId = request.levelId,
-                        attemptNumber = request.attemptNumber,
-                        symbol = request.symbol,
-                        role = OrderRole.CLOSE,
-                        slot = CLOSE_SLOT,
-                        side = closingSide(confirmedPositionAmount),
-                        type = OrderType.MARKET,
-                        confirmedQuantity = confirmedQuantity,
-                        reduceOnly = true,
-                        confirmedPositionAmount = confirmedPositionAmount,
-                    ),
+        val iocRequest = checkNotNull(
+            request.softCloseIntent(confirmedPositionAmount),
+        )
+        return Mono.zip(
+            orderExecutor.cancelActiveTakeProfits(request.levelId),
+            orderExecutor.executeNormalExit(
+                request = iocRequest,
+                wait = normalExitWait,
+            ),
+        )
+            .map { tuple ->
+                val cancellationComplete = tuple.t1
+                val iocResolution = tuple.t2
+                requireExpectedPositionOrFlat(
+                    request,
+                    iocResolution.confirmedPositionAmount,
+                )
+                NormalExitReconciliation(
+                    remainingPositionAmount =
+                        iocResolution.confirmedPositionAmount,
+                    hasUnresolvedOrder =
+                        !cancellationComplete ||
+                            iocResolution.hasUnresolvedOrder,
+                )
+            }
+            .flatMap { reconciliation ->
+                val remainingQuantity =
+                    reconciliation.remainingPositionAmount.abs()
+                updateRiskAfterClose(
+                    levelId = request.levelId,
+                    remainingQuantity = remainingQuantity,
+                ).then(
+                    if (remainingQuantity.signum() == 0) {
+                        finalizeClose(
+                            request = request,
+                            reason = reason,
+                            remainingQuantity = remainingQuantity,
+                            hasUnresolvedOrder =
+                                reconciliation.hasUnresolvedOrder,
+                        )
+                    } else {
+                        closeResidualWithMarket(
+                            request = request,
+                            reason = reason,
+                            confirmedPositionAmount =
+                                reconciliation.remainingPositionAmount,
+                            persistentUnresolvedOrder =
+                                reconciliation.hasUnresolvedOrder,
+                        )
+                    },
+                )
+            }
+    }
+
+    private fun closeExposureWithMarket(
+        request: BreakoutExecutionRequest,
+        reason: LevelReasonCode,
+        confirmedPositionAmount: BigDecimal,
+        additionResolution: OrderResolution?,
+        persistentUnresolvedOrder: Boolean,
+    ): Mono<BreakoutResult> {
+        val confirmedQuantity = confirmedPositionAmount.abs()
+        if (confirmedQuantity.signum() == 0) {
+            return finalizeClose(
+                request = request,
+                reason = reason,
+                remainingQuantity = BigDecimal.ZERO,
+                hasUnresolvedOrder = persistentUnresolvedOrder,
+                additionResolution = additionResolution,
+            )
+        }
+        return orderExecutor
+            .execute(
+                request.marketCloseIntent(
+                    confirmedPositionAmount = confirmedPositionAmount,
+                    slot = CLOSE_MARKET_SLOT,
                 ),
             )
             .flatMap { closeResolution ->
@@ -420,43 +527,105 @@ class BreakoutExecutionService internal constructor(
                     closeResolution.confirmedPositionAmount.abs()
                 updateRiskAfterClose(
                     levelId = request.levelId,
-                    previousQuantity = confirmedQuantity,
                     remainingQuantity = remainingQuantity,
                 ).then(
-                    levelCoordinator.terminate(
-                        levelId = request.levelId,
+                    finalizeClose(
+                        request = request,
                         reason = reason,
-                        confirmedRemainingQuantity = remainingQuantity,
+                        remainingQuantity = remainingQuantity,
                         hasUnresolvedOrder =
                             persistentUnresolvedOrder ||
                                 closeResolution.outcome == OrderOutcome.UNKNOWN,
-                    ),
-                ).thenReturn(
-                    terminatedResult(
-                        request = request,
-                        resolution = additionResolution,
-                        reason = reason,
-                        remainingQuantity = remainingQuantity,
+                        additionResolution = additionResolution,
                     ),
                 )
             }
     }
 
+    private fun closeResidualWithMarket(
+        request: BreakoutExitRequest,
+        reason: LevelReasonCode,
+        confirmedPositionAmount: BigDecimal,
+        persistentUnresolvedOrder: Boolean,
+    ): Mono<BreakoutResult> =
+        orderExecutor
+            .execute(
+                request.marketCloseIntent(
+                    confirmedPositionAmount = confirmedPositionAmount,
+                    slot = RESIDUAL_CLOSE_SLOT,
+                ),
+            )
+            .flatMap { closeResolution ->
+                val remainingQuantity =
+                    closeResolution.confirmedPositionAmount.abs()
+                updateRiskAfterClose(
+                    levelId = request.levelId,
+                    remainingQuantity = remainingQuantity,
+                ).then(
+                    finalizeClose(
+                        request = request,
+                        reason = reason,
+                        remainingQuantity = remainingQuantity,
+                        hasUnresolvedOrder =
+                            persistentUnresolvedOrder ||
+                                closeResolution.outcome == OrderOutcome.UNKNOWN,
+                    ),
+                )
+            }
+
+    private fun finalizeClose(
+        request: BreakoutExecutionRequest,
+        reason: LevelReasonCode,
+        remainingQuantity: BigDecimal,
+        hasUnresolvedOrder: Boolean,
+        additionResolution: OrderResolution? = null,
+    ): Mono<BreakoutResult> {
+        val cancelHardStop = if (remainingQuantity.signum() == 0) {
+            orderExecutor.cancelActiveHardStop(request.levelId).then()
+        } else {
+            Mono.empty()
+        }
+        return levelCoordinator
+            .terminatePosition(
+                levelId = request.levelId,
+                reason = reason,
+                confirmedRemainingQuantity = remainingQuantity,
+                hasUnresolvedOrder = hasUnresolvedOrder,
+                netResult = orderExecutor.positionResult(request.levelId),
+            )
+            .then(cancelHardStop)
+            .thenReturn(
+                terminatedResult(
+                    request = request,
+                    resolution = additionResolution,
+                    reason = reason,
+                    remainingQuantity = remainingQuantity,
+                ),
+            )
+    }
+
     private fun updateRiskAfterClose(
         levelId: java.util.UUID,
-        previousQuantity: BigDecimal,
         remainingQuantity: BigDecimal,
-    ): Mono<*> = when {
-        remainingQuantity.signum() == 0 ->
-            riskService.recordConfirmedFlat(levelId)
+    ): Mono<*> {
+        val currentQuantity = riskService
+            .currentState()
+            .attempts
+            .firstOrNull { attempt -> attempt.levelId == levelId }
+            ?.confirmedPositionQuantity
+            ?: return Mono.just(riskService.currentState())
+        return when {
+            remainingQuantity >= currentQuantity ->
+                Mono.just(riskService.currentState())
 
-        remainingQuantity < previousQuantity ->
-            riskService.recordConfirmedReducingFill(
+            remainingQuantity.signum() == 0 ->
+                riskService.recordConfirmedFlat(levelId)
+
+            else -> riskService.recordConfirmedReducingFill(
                 levelId = levelId,
                 confirmedRemainingQuantity = remainingQuantity,
             )
-
-        else -> Mono.just(riskService.currentState())
+        }
     }
 
     private fun terminatedResult(
@@ -504,6 +673,59 @@ private fun BreakoutExecutionRequest.signedPositionAmount(): BigDecimal =
         LevelDirection.LONG -> confirmedPositionQuantity
         LevelDirection.SHORT -> confirmedPositionQuantity.negate()
     }
+
+private fun BreakoutExitRequest.softCloseIntent(
+    confirmedPositionAmount: BigDecimal,
+): OrderIntentRequest? {
+    val npu = frozenNpu ?: return null
+    val increment = tickSize ?: return null
+    val rawPrice = when (direction) {
+        LevelDirection.LONG -> (bestBidPrice ?: return null).subtract(npu)
+        LevelDirection.SHORT -> (bestAskPrice ?: return null).add(npu)
+    }
+    if (rawPrice.signum() <= 0 || increment.signum() <= 0) {
+        return null
+    }
+    val cappedPrice = roundToIncrement(
+        value = rawPrice,
+        increment = increment,
+        roundingMode = when (direction) {
+            LevelDirection.LONG -> RoundingMode.UP
+            LevelDirection.SHORT -> RoundingMode.DOWN
+        },
+    )
+    return OrderIntentRequest(
+        levelId = levelId,
+        attemptNumber = attemptNumber,
+        symbol = symbol,
+        role = OrderRole.CLOSE,
+        slot = SOFT_CLOSE_IOC_SLOT,
+        side = closingSide(confirmedPositionAmount),
+        type = OrderType.LIMIT,
+        timeInForce = OrderTimeInForce.IOC,
+        confirmedQuantity = confirmedPositionAmount.abs(),
+        price = cappedPrice,
+        reduceOnly = true,
+        confirmedPositionAmount = confirmedPositionAmount,
+    )
+}
+
+private fun BreakoutExecutionRequest.marketCloseIntent(
+    confirmedPositionAmount: BigDecimal,
+    slot: Int,
+): OrderIntentRequest =
+    OrderIntentRequest(
+        levelId = levelId,
+        attemptNumber = attemptNumber,
+        symbol = symbol,
+        role = OrderRole.CLOSE,
+        slot = slot,
+        side = closingSide(confirmedPositionAmount),
+        type = OrderType.MARKET,
+        confirmedQuantity = confirmedPositionAmount.abs(),
+        reduceOnly = true,
+        confirmedPositionAmount = confirmedPositionAmount,
+    )
 
 private fun BreakoutAdditionRequest.takeProfitRequests(
     positionAmount: BigDecimal,
@@ -596,6 +818,18 @@ private fun requireExpectedPosition(
     }
 }
 
+private fun requireExpectedPositionOrFlat(
+    request: BreakoutExecutionRequest,
+    positionAmount: BigDecimal,
+) {
+    require(
+        positionAmount.signum() == 0 ||
+            positionAmount.signum() == request.expectedPositionSign(),
+    ) {
+        "Reconciled position does not match breakout direction"
+    }
+}
+
 private fun BreakoutExecutionRequest.expectedPositionSign(): Int =
     when (direction) {
         LevelDirection.LONG -> 1
@@ -623,7 +857,14 @@ private fun isIncrementAligned(
     RoundingMode.DOWN,
 ).compareTo(value) == 0
 
-private const val CLOSE_SLOT = 0
+private data class NormalExitReconciliation(
+    val remainingPositionAmount: BigDecimal,
+    val hasUnresolvedOrder: Boolean,
+)
+
+private const val CLOSE_MARKET_SLOT = 0
+private const val SOFT_CLOSE_IOC_SLOT = 0
+private const val RESIDUAL_CLOSE_SLOT = 1
 private const val MAXIMUM_CONCURRENT_ATTEMPTS = 5
 private const val CALCULATION_SCALE = 16
 private val TP1_ALLOCATION = BigDecimal("0.33")
@@ -634,3 +875,9 @@ private val TAKE_PROFIT_FRACTIONS = listOf(
     BigDecimal.ONE,
 )
 private val ONE_HUNDRED = BigDecimal("100")
+private val MAXIMUM_NORMAL_EXIT_WAIT: Duration = Duration.ofMillis(500)
+private val SOFT_EXIT_REASONS = setOf(
+    LevelReasonCode.EXIT_SCORE,
+    LevelReasonCode.SNAPBACK,
+    LevelReasonCode.MAX_HOLD_TIME,
+)

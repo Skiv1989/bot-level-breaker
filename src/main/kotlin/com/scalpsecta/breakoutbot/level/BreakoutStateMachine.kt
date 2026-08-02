@@ -25,12 +25,19 @@ internal data class BreakoutConfirmationEvaluation(
     val terminalReason: LevelReasonCode? = null,
 )
 
+internal data class PositionManagementEvaluation(
+    val exitScore: Int,
+    val activePointReasons: List<ExitPointReason>,
+    val terminalReason: LevelReasonCode? = null,
+)
+
 internal class BreakoutStateMachine {
     private var direction: LevelDirection? = null
     private var levelPrice: BigDecimal? = null
     private var frozenNpu: BigDecimal? = null
     private var preEntryFilledAt: Instant? = null
     private var confirmationStartedAt: Instant? = null
+    private var breakoutConfirmedAt: Instant? = null
     private var firstObservationAnchor: Instant? = null
     private var bestPostEntryPrice: BigDecimal? = null
     private var lastTradePrice: BigDecimal? = null
@@ -57,6 +64,7 @@ internal class BreakoutStateMachine {
         bestPostEntryPrice = favorableExtreme(direction, observedTradePrices)
         lastTradePrice = observedTradePrices.lastOrNull()
         confirmationStartedAt = null
+        breakoutConfirmedAt = null
         oppositeFlowSince = null
         collapsedAccelerationSince = null
         publicDataUnhealthySince = null
@@ -73,6 +81,11 @@ internal class BreakoutStateMachine {
     fun startConfirmation(startedAt: Instant) {
         require(crossed) { "crossing must be recorded before confirmation" }
         confirmationStartedAt = startedAt
+    }
+
+    fun startPositionManagement(confirmedAt: Instant) {
+        requireStarted()
+        breakoutConfirmedAt = confirmedAt
     }
 
     fun evaluatePreBreak(
@@ -129,7 +142,7 @@ internal class BreakoutStateMachine {
             behindLevel() > checkNotNull(frozenNpu) -> true
             !directionalPressureValid(observation.signal) -> true
             observation.signal.burst.status == BurstStatus.ACTIVE -> true
-            exitScore(observation) >= EXIT_SCORE_THRESHOLD -> true
+            exitEvaluation(observation).exitScore >= EXIT_SCORE_THRESHOLD -> true
             else -> false
         }
         if (confirmationFailure) {
@@ -168,6 +181,33 @@ internal class BreakoutStateMachine {
         } else {
             BreakoutConfirmationEvaluation(BreakoutConfirmationStatus.PENDING)
         }
+    }
+
+    fun evaluatePositionManagement(
+        observation: BreakoutObservation,
+    ): PositionManagementEvaluation {
+        update(observation)
+        val evaluation = exitEvaluation(observation)
+        val confirmedAt = checkNotNull(breakoutConfirmedAt) {
+            "breakout confirmation must start position management"
+        }
+        val reason = when {
+            !observation.observedAt.isBefore(confirmedAt) &&
+                !observation.observedAt.isAfter(
+                    confirmedAt.plus(SNAPBACK_WINDOW),
+                ) &&
+                behindLevel() > checkNotNull(frozenNpu).multiply(TWO) ->
+                LevelReasonCode.SNAPBACK
+
+            reached(confirmedAt, observation.observedAt, MAXIMUM_HOLDING_TIME) ->
+                LevelReasonCode.MAX_HOLD_TIME
+
+            evaluation.exitScore >= EXIT_SCORE_THRESHOLD ->
+                LevelReasonCode.EXIT_SCORE
+
+            else -> null
+        }
+        return evaluation.copy(terminalReason = reason)
     }
 
     private fun update(observation: BreakoutObservation) {
@@ -243,7 +283,9 @@ internal class BreakoutStateMachine {
             .single { result -> result.gate == SignalGate.DIRECTIONAL_FLOW }
             .passed
 
-    private fun exitScore(observation: BreakoutObservation): Int {
+    private fun exitEvaluation(
+        observation: BreakoutObservation,
+    ): PositionManagementEvaluation {
         val signal = observation.signal
         val npu = checkNotNull(frozenNpu)
         val lowProgress = signal.windows.mid.signedPriceProgress <
@@ -260,15 +302,15 @@ internal class BreakoutStateMachine {
             LevelDirection.LONG -> signal.windows.slow.averageSellSize
             LevelDirection.SHORT -> signal.windows.slow.averageBuySize
         }
-        var score = 0
+        val activeReasons = mutableListOf<ExitPointReason>()
         if (directionalShare >= DIRECTIONAL_ABSORPTION_SHARE && lowProgress) {
-            score += 2
+            activeReasons += ExitPointReason.DIRECTIONAL_ABSORPTION
         }
         if (
             oppositeSlowSize.signum() > 0 &&
             oppositeFastSize >= oppositeSlowSize.multiply(TWO)
         ) {
-            score += 1
+            activeReasons += ExitPointReason.OPPOSITE_AVERAGE_TRADE_SIZE
         }
         if (
             persisted(
@@ -277,19 +319,22 @@ internal class BreakoutStateMachine {
                 FLOW_FAILURE_DURATION,
             )
         ) {
-            score += 2
+            activeReasons += ExitPointReason.PERSISTENT_OPPOSITE_DELTA
         }
         if (behindLevel() > npu) {
-            score += 2
+            activeReasons += ExitPointReason.PRICE_BEHIND_LEVEL
         }
         val activityRatio = maxOf(
             signal.acceleration.tradesPerSecondRatio,
             signal.acceleration.volumeRateRatio,
         )
         if (activityRatio >= ABSORPTION_ACTIVITY_RATIO && lowProgress) {
-            score += 1
+            activeReasons += ExitPointReason.HIGH_ACTIVITY_LOW_PROGRESS
         }
-        return score
+        return PositionManagementEvaluation(
+            exitScore = activeReasons.sumOf(ExitPointReason::points),
+            activePointReasons = activeReasons,
+        )
     }
 
     private fun requireStarted() {
@@ -335,6 +380,8 @@ private val ACCELERATION_FAILURE_DURATION: Duration = Duration.ofMillis(500)
 private val DATA_FAILURE_DURATION: Duration = Duration.ofSeconds(3)
 private val NO_CROSS_TIMEOUT: Duration = Duration.ofSeconds(5)
 private val CONFIRMATION_DURATION: Duration = Duration.ofSeconds(1)
+private val SNAPBACK_WINDOW: Duration = Duration.ofMillis(500)
+private val MAXIMUM_HOLDING_TIME: Duration = Duration.ofMinutes(10)
 private val HALF = BigDecimal("0.50")
 private val QUARTER = BigDecimal("0.25")
 private val TWO = BigDecimal("2")

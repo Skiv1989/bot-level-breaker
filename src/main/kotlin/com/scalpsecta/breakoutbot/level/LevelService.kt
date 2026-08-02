@@ -97,6 +97,7 @@ class LevelService internal constructor(
     private val lock = ReentrantLock()
     private val levels = linkedMapOf<UUID, StoredLevel>()
     private val symbolRuntimes = mutableMapOf<String, SymbolRuntime>()
+    private val symbolCooldowns = SymbolCooldowns()
     private val symbolConfigurationPermits =
         ConcurrentHashMap<String, Semaphore>()
     private val eventScheduler: Scheduler = Schedulers.newParallel("level-events")
@@ -391,17 +392,21 @@ class LevelService internal constructor(
             },
         ).then()
 
-    override fun recordTakeProfitFill(
+    override fun recordPositionReduction(
         levelId: UUID,
         confirmedRemainingQuantity: BigDecimal,
+        terminalReason: LevelReasonCode?,
+        netResult: PositionNetResult?,
     ): Mono<Void> =
         submitPreEntryEvent(
             levelId = levelId,
             event = { publicMarketData ->
-                SymbolLevelEvent.TakeProfitFilled(
+                SymbolLevelEvent.PositionReduced(
                     levelId = levelId,
                     confirmedRemainingQuantity =
                         confirmedRemainingQuantity,
+                    terminalReason = terminalReason,
+                    netResult = netResult,
                     processedAt = clock.instant(),
                     publicMarketData = publicMarketData,
                 )
@@ -413,6 +418,34 @@ class LevelService internal constructor(
         reason: LevelReasonCode,
         confirmedRemainingQuantity: BigDecimal,
         hasUnresolvedOrder: Boolean,
+    ): Mono<Void> = submitTermination(
+        levelId = levelId,
+        reason = reason,
+        confirmedRemainingQuantity = confirmedRemainingQuantity,
+        hasUnresolvedOrder = hasUnresolvedOrder,
+        netResult = null,
+    )
+
+    override fun terminatePosition(
+        levelId: UUID,
+        reason: LevelReasonCode,
+        confirmedRemainingQuantity: BigDecimal,
+        hasUnresolvedOrder: Boolean,
+        netResult: PositionNetResult?,
+    ): Mono<Void> = submitTermination(
+        levelId = levelId,
+        reason = reason,
+        confirmedRemainingQuantity = confirmedRemainingQuantity,
+        hasUnresolvedOrder = hasUnresolvedOrder,
+        netResult = netResult,
+    )
+
+    private fun submitTermination(
+        levelId: UUID,
+        reason: LevelReasonCode,
+        confirmedRemainingQuantity: BigDecimal,
+        hasUnresolvedOrder: Boolean,
+        netResult: PositionNetResult?,
     ): Mono<Void> =
         submitPreEntryEvent(
             levelId = levelId,
@@ -422,6 +455,7 @@ class LevelService internal constructor(
                     reason = reason,
                     confirmedRemainingQuantity = confirmedRemainingQuantity,
                     hasUnresolvedOrder = hasUnresolvedOrder,
+                    netResult = netResult,
                     processedAt = clock.instant(),
                     publicMarketData = publicMarketData,
                 )
@@ -453,6 +487,7 @@ class LevelService internal constructor(
             symbolRuntimes.values.toList().also {
                 symbolRuntimes.clear()
                 levels.clear()
+                symbolCooldowns.clear()
             }
         }
         symbolConfigurationPermits.clear()
@@ -514,8 +549,8 @@ class LevelService internal constructor(
                 is SymbolLevelEvent.FinalFilled ->
                     recordFinalFill(event)
 
-                is SymbolLevelEvent.TakeProfitFilled ->
-                    recordTakeProfitFill(event)
+                is SymbolLevelEvent.PositionReduced ->
+                    recordPositionReduction(event)
 
                 is SymbolLevelEvent.AggregateTrade -> {
                     evidenceRecorder.record(event.event)
@@ -1027,6 +1062,15 @@ class LevelService internal constructor(
         stored.pendingBreakoutRequest = null
         stored.breakoutRequestClaimed = false
         stored.deferredBreakoutReason = null
+        val confirmedExit =
+            before.confirmedPositionQuantity.signum() > 0 &&
+                event.confirmedRemainingQuantity.signum() == 0
+        if (confirmedExit) {
+            startSymbolCooldown(before.symbol, event.processedAt)
+        }
+        val alreadyConfirmedFlat =
+            before.state == LevelState.TERMINAL &&
+                before.confirmedPositionQuantity.signum() == 0
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.TERMINAL,
             stateChangedAt = if (before.state == LevelState.TERMINAL) {
@@ -1034,7 +1078,11 @@ class LevelService internal constructor(
             } else {
                 event.processedAt
             },
-            terminalReason = event.reason,
+            terminalReason = if (alreadyConfirmedFlat) {
+                before.terminalReason
+            } else {
+                event.reason
+            },
             confirmedPositionQuantity = event.confirmedRemainingQuantity,
             ownsActiveAttempt =
                 event.confirmedRemainingQuantity.signum() > 0 ||
@@ -1044,6 +1092,7 @@ class LevelService internal constructor(
             deleteAllowed =
                 event.confirmedRemainingQuantity.signum() == 0 &&
                     !event.hasUnresolvedOrder,
+            netResult = event.netResult ?: before.netResult,
         )
         return currentSnapshot(
             stored = stored,
@@ -1196,15 +1245,23 @@ class LevelService internal constructor(
         stored.pendingBreakoutRequest = null
         stored.breakoutRequestClaimed = false
         stored.snapshot = stored.snapshot.copy(
-            state = LevelState.POSITION_MANAGEMENT,
-            stateChangedAt = event.processedAt,
-            terminalReason = null,
             confirmedPositionQuantity = event.confirmedPositionQuantity,
             ownsActiveAttempt = true,
             ownsExposure = true,
             hasUnresolvedOrder = false,
             deleteAllowed = false,
         )
+        val deferredReason = stored.deferredBreakoutReason
+        stored.deferredBreakoutReason = null
+        if (deferredReason != null) {
+            startBreakoutExit(stored, event.processedAt, deferredReason)
+        } else {
+            stored.snapshot = stored.snapshot.copy(
+                state = LevelState.POSITION_MANAGEMENT,
+                stateChangedAt = event.processedAt,
+                terminalReason = null,
+            )
+        }
         return currentSnapshot(
             stored = stored,
             publicMarketData = event.publicMarketData,
@@ -1217,8 +1274,8 @@ class LevelService internal constructor(
         }
     }
 
-    private fun recordTakeProfitFill(
-        event: SymbolLevelEvent.TakeProfitFilled,
+    private fun recordPositionReduction(
+        event: SymbolLevelEvent.PositionReduced,
     ): LevelSnapshot {
         require(event.confirmedRemainingQuantity.signum() >= 0) {
             "confirmedRemainingQuantity must not be negative"
@@ -1228,32 +1285,44 @@ class LevelService internal constructor(
             "Level ${event.levelId} does not exist",
         )
         val before = stored.snapshot
-        check(before.state == LevelState.POSITION_MANAGEMENT) {
-            "Level ${event.levelId} is not managing a confirmed position"
+        check(
+            before.state != LevelState.TERMINAL &&
+                before.confirmedPositionQuantity.signum() > 0,
+        ) {
+            "Level ${event.levelId} does not own confirmed exposure"
         }
         require(
             event.confirmedRemainingQuantity <
                 before.confirmedPositionQuantity,
         ) {
-            "A take-profit fill must reduce confirmed exposure"
+            "A confirmed reducing fill must reduce confirmed exposure"
         }
         stored.snapshot = if (event.confirmedRemainingQuantity.signum() == 0) {
+            val reason = checkNotNull(event.terminalReason) {
+                "A confirmed flat reduction requires a terminal reason"
+            }
+            startSymbolCooldown(before.symbol, event.processedAt)
             before.copy(
                 state = LevelState.TERMINAL,
                 stateChangedAt = event.processedAt,
-                terminalReason = LevelReasonCode.TAKE_PROFITS_COMPLETE,
+                terminalReason = reason,
                 confirmedPositionQuantity = BigDecimal.ZERO,
                 ownsActiveAttempt = false,
                 ownsExposure = false,
                 hasUnresolvedOrder = false,
                 deleteAllowed = true,
+                netResult = event.netResult,
             )
         } else {
+            require(event.terminalReason == null) {
+                "A partial reducing fill cannot be terminal"
+            }
             before.copy(
                 confirmedPositionQuantity =
                     event.confirmedRemainingQuantity,
                 ownsExposure = true,
                 deleteAllowed = false,
+                netResult = event.netResult ?: before.netResult,
             )
         }
         return currentSnapshot(
@@ -1342,6 +1411,36 @@ class LevelService internal constructor(
                 }
             }
 
+            LevelState.CONFIRM_ENTRY_PENDING -> {
+                val evaluation = stored.breakoutStateMachine
+                    .evaluatePositionManagement(observation)
+                stored.snapshot = stored.snapshot.copy(
+                    exitScore = evaluation.exitScore,
+                    activeExitPointReasons = evaluation.activePointReasons,
+                )
+                if (evaluation.terminalReason != null) {
+                    stored.deferredBreakoutReason =
+                        stored.deferredBreakoutReason
+                            ?: evaluation.terminalReason
+                }
+            }
+
+            LevelState.POSITION_MANAGEMENT -> {
+                val evaluation = stored.breakoutStateMachine
+                    .evaluatePositionManagement(observation)
+                stored.snapshot = stored.snapshot.copy(
+                    exitScore = evaluation.exitScore,
+                    activeExitPointReasons = evaluation.activePointReasons,
+                )
+                if (evaluation.terminalReason != null) {
+                    startBreakoutExit(
+                        stored = stored,
+                        processedAt = processedAt,
+                        reason = evaluation.terminalReason,
+                    )
+                }
+            }
+
             else -> Unit
         }
     }
@@ -1374,11 +1473,13 @@ class LevelService internal constructor(
         stored: StoredLevel,
         processedAt: Instant,
     ) {
+        stored.breakoutStateMachine.startPositionManagement(processedAt)
         stored.snapshot = stored.snapshot.copy(
             state = LevelState.CONFIRM_ENTRY_PENDING,
             stateChangedAt = processedAt,
             terminalReason = null,
             breakoutConfirmedAt = processedAt,
+            maximumHoldingDeadline = processedAt.plus(MAXIMUM_HOLDING_TIME),
         )
         val request = buildBreakoutAdditionRequest(
             stored = stored,
@@ -1417,6 +1518,10 @@ class LevelService internal constructor(
                 confirmedPositionQuantity =
                     stored.snapshot.confirmedPositionQuantity,
                 reason = reason,
+                bestBidPrice = stored.snapshot.signal.bidPrice,
+                bestAskPrice = stored.snapshot.signal.askPrice,
+                frozenNpu = stored.snapshot.signal.npu.absolute,
+                tickSize = stored.tickSize,
             ),
         )
     }
@@ -2383,10 +2488,12 @@ class LevelService internal constructor(
         privateStreamReadiness: BinanceReadiness,
         globalState: GlobalTradingState,
         now: Instant = clock.instant(),
-    ): LevelSnapshot =
-        stored.snapshot.copy(
+    ): LevelSnapshot {
+        val cooldownUntil = activeSymbolCooldown(stored.snapshot.symbol, now)
+        return stored.snapshot.copy(
             globalState = globalState,
-            blockers = blockers(stored, globalState),
+            blockers = blockers(stored, globalState, cooldownUntil),
+            symbolCooldownUntil = cooldownUntil,
             signal = stored.signalTracker.snapshot(
                 publicMarketData = publicMarketData,
                 privateStreamReadiness = privateStreamReadiness,
@@ -2394,10 +2501,12 @@ class LevelService internal constructor(
                 now = now,
             ),
         )
+    }
 
     private fun blockers(
         stored: StoredLevel,
         globalState: GlobalTradingState,
+        cooldownUntil: Instant?,
     ): List<LevelBlocker> =
         buildList {
             when (stored.snapshot.state) {
@@ -2423,6 +2532,9 @@ class LevelService internal constructor(
                 GlobalTradingState.DAILY_LOCKED -> add(LevelBlocker.DAILY_LOCKED)
                 GlobalTradingState.MANUAL_LOCK -> add(LevelBlocker.MANUAL_LOCK)
             }
+            if (cooldownUntil != null) {
+                add(LevelBlocker.SYMBOL_COOLDOWN)
+            }
             val anotherOwner = levels.values.any { candidate ->
                 candidate.snapshot.symbol == stored.snapshot.symbol &&
                     candidate.snapshot.id != stored.snapshot.id &&
@@ -2432,6 +2544,14 @@ class LevelService internal constructor(
                 add(LevelBlocker.SYMBOL_HAS_ACTIVE_OWNER)
             }
         }
+
+    private fun startSymbolCooldown(symbol: String, confirmedFlatAt: Instant) {
+        symbolCooldowns.start(symbol, confirmedFlatAt)
+    }
+
+    private fun activeSymbolCooldown(symbol: String, now: Instant): Instant? {
+        return symbolCooldowns.activeUntil(symbol, now)
+    }
 
     private fun roundToIncrement(
         value: BigDecimal,
@@ -2589,6 +2709,7 @@ private sealed interface SymbolLevelEvent {
         val reason: LevelReasonCode,
         val confirmedRemainingQuantity: BigDecimal,
         val hasUnresolvedOrder: Boolean,
+        val netResult: PositionNetResult?,
         val processedAt: Instant,
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent
@@ -2615,9 +2736,11 @@ private sealed interface SymbolLevelEvent {
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent
 
-    data class TakeProfitFilled(
+    data class PositionReduced(
         val levelId: UUID,
         val confirmedRemainingQuantity: BigDecimal,
+        val terminalReason: LevelReasonCode?,
+        val netResult: PositionNetResult?,
         val processedAt: Instant,
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent
@@ -2663,6 +2786,7 @@ private const val MAX_LEVERAGE = 20
 private const val CALCULATION_SCALE = 16
 private val EVENT_SAMPLE_INTERVAL: Duration = Duration.ofMillis(100)
 private val WARMUP_DURATION: Duration = Duration.ofSeconds(10)
+private val MAXIMUM_HOLDING_TIME: Duration = Duration.ofMinutes(10)
 private val ACTIVATION_NPU_MULTIPLIER = BigDecimal("8")
 private val PRE_ENTRY_NPU_MULTIPLIER = BigDecimal("2")
 private val PRE_ENTRY_MICRO_SWING_WINDOW: Duration = Duration.ofSeconds(1)

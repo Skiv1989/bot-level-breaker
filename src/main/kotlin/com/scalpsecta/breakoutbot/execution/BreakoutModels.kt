@@ -2,6 +2,7 @@ package com.scalpsecta.breakoutbot.execution
 
 import com.scalpsecta.breakoutbot.level.LevelDirection
 import com.scalpsecta.breakoutbot.level.LevelReasonCode
+import com.scalpsecta.breakoutbot.level.PositionNetResult
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import java.math.BigDecimal
@@ -46,6 +47,10 @@ data class BreakoutExitRequest(
     override val direction: LevelDirection,
     override val confirmedPositionQuantity: BigDecimal,
     val reason: LevelReasonCode,
+    val bestBidPrice: BigDecimal? = null,
+    val bestAskPrice: BigDecimal? = null,
+    val frozenNpu: BigDecimal? = null,
+    val tickSize: BigDecimal? = null,
 ) : BreakoutExecutionRequest
 
 enum class BreakoutTranche(
@@ -89,12 +94,21 @@ data class TakeProfitSetConfirmation(
     val reconciliationChecks: Int,
 )
 
-data class TakeProfitFill(
+data class PositionReduction(
     val levelId: UUID,
     val symbol: String,
     val clientOrderId: String,
+    val role: OrderRole,
     val confirmedRemainingQuantity: BigDecimal,
-    val allTakeProfitsFilled: Boolean,
+    val terminalReason: LevelReasonCode? = null,
+    val netResult: PositionNetResult? = null,
+)
+
+data class NormalExitResolution(
+    val intent: OrderIntent,
+    val outcome: OrderOutcome,
+    val confirmedPositionAmount: BigDecimal,
+    val hasUnresolvedOrder: Boolean,
 )
 
 interface BreakoutOrderExecutor {
@@ -116,7 +130,37 @@ interface BreakoutOrderExecutor {
 
     fun cancelTakeProfits(intents: List<OrderIntent>): Mono<Boolean>
 
-    fun takeProfitFills(): Flux<TakeProfitFill>
+    fun cancelActiveTakeProfits(levelId: UUID): Mono<Boolean> = Mono.just(true)
+
+    fun cancelActiveHardStop(levelId: UUID): Mono<Boolean> = Mono.just(true)
+
+    fun reconcilePositionAfter(
+        symbol: String,
+        clientOrderId: String,
+        wait: Duration,
+    ): Mono<BigDecimal> = Mono.delay(wait).then(reconcilePosition(symbol, clientOrderId))
+
+    fun executeNormalExit(
+        request: OrderIntentRequest,
+        wait: Duration,
+    ): Mono<NormalExitResolution> = execute(request).flatMap { resolution ->
+        reconcilePositionAfter(
+            symbol = request.symbol,
+            clientOrderId = resolution.intent.clientOrderId,
+            wait = wait,
+        ).map { positionAmount ->
+            NormalExitResolution(
+                intent = resolution.intent,
+                outcome = resolution.outcome,
+                confirmedPositionAmount = positionAmount,
+                hasUnresolvedOrder = resolution.outcome == OrderOutcome.UNKNOWN,
+            )
+        }
+    }
+
+    fun positionReductions(): Flux<PositionReduction>
+
+    fun positionResult(levelId: UUID): PositionNetResult? = null
 }
 
 interface BreakoutLevelCoordinator {
@@ -138,15 +182,18 @@ interface BreakoutLevelCoordinator {
         confirmedPositionQuantity: BigDecimal,
     ): Mono<Void>
 
-    fun recordTakeProfitFill(
+    fun recordPositionReduction(
         levelId: UUID,
         confirmedRemainingQuantity: BigDecimal,
+        terminalReason: LevelReasonCode?,
+        netResult: PositionNetResult?,
     ): Mono<Void>
 
-    fun terminate(
+    fun terminatePosition(
         levelId: UUID,
         reason: LevelReasonCode,
         confirmedRemainingQuantity: BigDecimal,
         hasUnresolvedOrder: Boolean,
+        netResult: PositionNetResult?,
     ): Mono<Void>
 }

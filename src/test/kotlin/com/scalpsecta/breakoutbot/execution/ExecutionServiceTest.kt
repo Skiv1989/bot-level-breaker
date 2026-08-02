@@ -11,6 +11,8 @@ import com.scalpsecta.breakoutbot.binance.BinancePositionUpdate
 import com.scalpsecta.breakoutbot.binance.BinanceUserDataEvent
 import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
+import com.scalpsecta.breakoutbot.level.LevelReasonCode
+import com.scalpsecta.breakoutbot.level.PositionNetResult
 import com.scalpsecta.breakoutbot.risk.AttemptRiskService
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -345,8 +347,8 @@ class ExecutionServiceTest {
             )
             .block(TIMEOUT)!!
         harness.service.activateTakeProfits(confirmation).block(TIMEOUT)
-        val fills = mutableListOf<TakeProfitFill>()
-        val fillSubscription = harness.service.takeProfitFills().subscribe(fills::add)
+        val fills = mutableListOf<PositionReduction>()
+        val fillSubscription = harness.service.positionReductions().subscribe(fills::add)
 
         val placements = confirmation.intents.map { intent ->
             harness.client.placements.single { request ->
@@ -358,6 +360,7 @@ class ExecutionServiceTest {
                 request = placements[0],
                 status = "PARTIALLY_FILLED",
                 filledQuantity = "0.050",
+                tradeId = 2101L,
             ),
         )
         harness.events.tryEmitNext(
@@ -365,6 +368,8 @@ class ExecutionServiceTest {
                 request = placements[0],
                 status = "FILLED",
                 filledQuantity = "0.099",
+                lastFilledQuantity = "0.049",
+                tradeId = 2102L,
             ),
         )
         harness.events.tryEmitNext(
@@ -372,6 +377,7 @@ class ExecutionServiceTest {
                 request = placements[1],
                 status = "FILLED",
                 filledQuantity = "0.099",
+                tradeId = 2103L,
             ),
         )
         harness.events.tryEmitNext(
@@ -379,10 +385,11 @@ class ExecutionServiceTest {
                 request = placements[2],
                 status = "FILLED",
                 filledQuantity = "0.102",
+                tradeId = 2104L,
             ),
         )
 
-        assertThat(fills.map(TakeProfitFill::confirmedRemainingQuantity))
+        assertThat(fills.map(PositionReduction::confirmedRemainingQuantity))
             .usingElementComparator(BigDecimal::compareTo)
             .containsExactly(
                 BigDecimal("0.250"),
@@ -390,13 +397,137 @@ class ExecutionServiceTest {
                 BigDecimal("0.102"),
                 BigDecimal.ZERO,
             )
-        assertThat(fills.last().allTakeProfitsFilled).isTrue()
+        assertThat(fills.last().terminalReason)
+            .isEqualTo(LevelReasonCode.TAKE_PROFITS_COMPLETE)
+        assertThat(fills.last().netResult).isEqualTo(
+            PositionNetResult(
+                grossPnl = BigDecimal.ZERO,
+                fees = BigDecimal("0.04"),
+                funding = BigDecimal.ZERO,
+                slippage = BigDecimal("0.26190"),
+                netPnl = BigDecimal("-0.04"),
+            ),
+        )
         val hardStop = harness.service.currentState().orders.single { order ->
             order.role == OrderRole.HARD_STOP
         }
         assertThat(hardStop.stopPrice).isEqualByComparingTo("99.7")
         assertThat(hardStop.outcome).isEqualTo(OrderOutcome.ACTIVE)
         fillSubscription.dispose()
+    }
+
+    @Test
+    fun `hard-stop fill emits a terminal reduction with known net result`() {
+        val harness = harness()
+        harness.client.onReconcile = { _, clientOrderId ->
+            Mono.just(
+                activeHardStopReconciliation(
+                    clientOrderId = clientOrderId,
+                    stopPrice = BigDecimal("99.7"),
+                    workingType = "CONTRACT_PRICE",
+                    priceProtect = false,
+                ),
+            )
+        }
+        harness.service.confirmHardStop(hardStopRequest()).block(TIMEOUT)
+        val reductions = mutableListOf<PositionReduction>()
+        val subscription = harness.service.positionReductions()
+            .subscribe(reductions::add)
+        harness.events.tryEmitNext(
+            accountUpdate("0.30").copy(
+                reason = "FUNDING_FEE",
+                balances = listOf(
+                    BinanceBalanceUpdate(
+                        asset = "USDT",
+                        walletBalance = BigDecimal("999.95"),
+                        crossWalletBalance = BigDecimal("999.95"),
+                        balanceChange = BigDecimal("-0.05"),
+                    ),
+                ),
+            ),
+        )
+        val hardStop = harness.client.placements.single { request ->
+            request.type == "STOP_MARKET"
+        }
+        harness.events.tryEmitNext(
+            orderUpdate(
+                request = hardStop,
+                status = "FILLED",
+                filledQuantity = "0.30",
+                fillPrice = "99.5",
+                commission = "0.02",
+                realizedProfit = "-1.50",
+                tradeId = 3001L,
+            ),
+        )
+
+        assertThat(reductions).hasSize(1)
+        val reduction = reductions.single()
+        assertThat(reduction.role).isEqualTo(OrderRole.HARD_STOP)
+        assertThat(reduction.confirmedRemainingQuantity)
+            .isEqualByComparingTo("0")
+        assertThat(reduction.terminalReason)
+            .isEqualTo(LevelReasonCode.HARD_STOP_FILLED)
+        assertThat(reduction.netResult).isEqualTo(
+            PositionNetResult(
+                grossPnl = BigDecimal("-1.50"),
+                fees = BigDecimal("0.02"),
+                funding = BigDecimal("-0.05"),
+                slippage = BigDecimal("0.060"),
+                netPnl = BigDecimal("-1.57"),
+            ),
+        )
+        subscription.dispose()
+    }
+
+    @Test
+    fun `normal exit places once waits then performs one authoritative reconciliation`() {
+        val harness = harness()
+        var reconciliationCount = 0
+        harness.client.onReconcile = { _, clientOrderId ->
+            reconciliationCount += 1
+            Mono.just(
+                BinanceOrderReconciliation(
+                    order = reconciledOrder(
+                        clientOrderId = clientOrderId,
+                        status = "CANCELED",
+                        filledQuantity = "0.18",
+                    ).copy(
+                        reduceOnly = true,
+                        type = "LIMIT",
+                        side = "SELL",
+                        timeInForce = "IOC",
+                        price = BigDecimal("99.8"),
+                    ),
+                    position = BinancePositionRisk(
+                        symbol = SYMBOL,
+                        positionAmount = BigDecimal("0.12"),
+                        entryPrice = BigDecimal("100"),
+                    ),
+                    openClientOrderIds = emptySet(),
+                ),
+            )
+        }
+
+        val result = harness.service.executeNormalExit(
+            request = closeRequest().copy(
+                slot = 0,
+                type = OrderType.LIMIT,
+                timeInForce = OrderTimeInForce.IOC,
+                price = BigDecimal("99.8"),
+            ),
+            wait = Duration.ofMillis(20),
+        ).block(TIMEOUT)!!
+
+        assertThat(harness.client.placements).hasSize(1)
+        val placement = harness.client.placements.single()
+        assertThat(placement.type).isEqualTo("LIMIT")
+        assertThat(placement.timeInForce).isEqualTo("IOC")
+        assertThat(placement.reduceOnly).isTrue()
+        assertThat(reconciliationCount).isEqualTo(1)
+        assertThat(result.outcome).isEqualTo(OrderOutcome.PARTIALLY_FILLED)
+        assertThat(result.confirmedPositionAmount).isEqualByComparingTo("0.12")
+        assertThat(result.hasUnresolvedOrder).isFalse()
     }
 
     @Test
@@ -719,6 +850,11 @@ class ExecutionServiceTest {
         request: BinanceOrderRequest,
         status: String,
         filledQuantity: String,
+        lastFilledQuantity: String = filledQuantity,
+        fillPrice: String = "100.50",
+        commission: String = "0.01",
+        realizedProfit: String = "0",
+        tradeId: Long = 2001L,
     ): BinanceUserDataEvent.OrderUpdate =
         BinanceUserDataEvent.OrderUpdate(
             eventTime = EVENT_AT,
@@ -731,18 +867,18 @@ class ExecutionServiceTest {
             timeInForce = request.timeInForce.orEmpty(),
             originalQuantity = request.quantity ?: BigDecimal("0.30"),
             originalPrice = request.price ?: BigDecimal.ZERO,
-            averagePrice = BigDecimal("100.50"),
+            averagePrice = BigDecimal(fillPrice),
             stopPrice = request.stopPrice ?: BigDecimal.ZERO,
             executionType = if (status == "REJECTED") "NEW" else "TRADE",
             orderStatus = status,
             orderId = 1001L,
-            lastFilledQuantity = BigDecimal(filledQuantity),
+            lastFilledQuantity = BigDecimal(lastFilledQuantity),
             accumulatedFilledQuantity = BigDecimal(filledQuantity),
-            lastFilledPrice = BigDecimal("100.50"),
+            lastFilledPrice = BigDecimal(fillPrice),
             commissionAsset = "USDT",
-            commission = BigDecimal("0.01"),
-            tradeId = 2001L,
-            realizedProfit = BigDecimal.ZERO,
+            commission = BigDecimal(commission),
+            tradeId = tradeId,
+            realizedProfit = BigDecimal(realizedProfit),
             positionSide = "BOTH",
             reduceOnly = request.reduceOnly,
         )

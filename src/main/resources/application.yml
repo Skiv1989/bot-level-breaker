@@ -27,6 +27,7 @@ bot:
     reconciliation-interval: 1s
     stop-confirmation-timeout: 2s
     take-profit-setup-timeout: 3s
+    normal-exit-wait: 500ms
   security:
     username: "${BOT_BASIC_USERNAME}"
     password: "${BOT_BASIC_PASSWORD}"

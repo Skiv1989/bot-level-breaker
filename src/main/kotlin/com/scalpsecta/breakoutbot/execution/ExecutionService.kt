@@ -14,6 +14,8 @@ import com.scalpsecta.breakoutbot.evidence.OrderEvidence
 import com.scalpsecta.breakoutbot.evidence.QuantityEvidence
 import com.scalpsecta.breakoutbot.evidence.ReconciliationEvidence
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
+import com.scalpsecta.breakoutbot.level.LevelReasonCode
+import com.scalpsecta.breakoutbot.level.PositionNetResult
 import com.scalpsecta.breakoutbot.risk.AttemptRiskService
 import com.scalpsecta.breakoutbot.service.AuthenticatedBinanceReadinessService
 import jakarta.annotation.PreDestroy
@@ -79,16 +81,19 @@ class ExecutionService internal constructor(
     )
 
     private val pendingOrders = ConcurrentHashMap<String, PendingOrder>()
+    private val intents = ConcurrentHashMap<String, OrderIntent>()
     private val orders = ConcurrentHashMap<String, OrderExecutionSnapshot>()
     private val positions = ConcurrentHashMap<String, ExecutionPositionSnapshot>()
     private val balances = ConcurrentHashMap<String, ExecutionBalanceSnapshot>()
     private val activeSymbols = ConcurrentHashMap.newKeySet<String>()
     private val activeTakeProfitSets =
         ConcurrentHashMap<UUID, ActiveTakeProfitSet>()
-    private val takeProfitFillSink = Sinks
+    private val activeHardStops = ConcurrentHashMap<UUID, ActiveHardStop>()
+    private val attemptAccounting = ConcurrentHashMap<UUID, AttemptAccounting>()
+    private val positionReductionSink = Sinks
         .many()
         .multicast()
-        .onBackpressureBuffer<TakeProfitFill>()
+        .onBackpressureBuffer<PositionReduction>()
     private val subscriptions = Disposables.composite()
 
     init {
@@ -117,7 +122,10 @@ class ExecutionService internal constructor(
 
     override fun execute(request: OrderIntentRequest): Mono<OrderResolution> {
         val intent = clientOrderIdFactory.create(request)
-        return dispatch(intent, closeOnUnknown = true).cache()
+        return dispatch(
+            intent,
+            closeOnUnknown = !intent.role.closesExposure,
+        ).cache()
     }
 
     override fun confirmHardStop(
@@ -141,6 +149,7 @@ class ExecutionService internal constructor(
                         eventId = "hard-stop-intent:${intent.clientOrderId}",
                     ) {
                         recordIntent(intent)
+                        activeHardStops[intent.levelId] = ActiveHardStop(intent)
                     },
                 )
                 .then(placeAndConfirmHardStop(intent))
@@ -216,10 +225,7 @@ class ExecutionService internal constructor(
                                 levelId = intents.first().levelId,
                                 symbol = intents.first().symbol,
                                 initialPositionAmount = positionAmount,
-                                clientOrderIds = intents.mapTo(
-                                    linkedSetOf(),
-                                    OrderIntent::clientOrderId,
-                                ),
+                                intents = intents,
                             )
                     },
                 )
@@ -276,6 +282,225 @@ class ExecutionService internal constructor(
             }
     }
 
+    override fun cancelActiveTakeProfits(levelId: UUID): Mono<Boolean> {
+        val activeSet = activeTakeProfitSets[levelId] ?: return Mono.just(true)
+        return cancelTakeProfits(activeSet.intents)
+    }
+
+    override fun cancelActiveHardStop(levelId: UUID): Mono<Boolean> {
+        val activeStop = activeHardStops[levelId] ?: return Mono.just(true)
+        return client
+            .cancelOrder(activeStop.intent.symbol, activeStop.intent.clientOrderId)
+            .timeout(requestTimeout, scheduler)
+            .thenReturn(true)
+            .onErrorReturn(false)
+            .doOnNext { complete ->
+                if (complete) {
+                    activeHardStops.remove(levelId, activeStop)
+                    orders.computeIfPresent(activeStop.intent.clientOrderId) {
+                            _, current,
+                        ->
+                        current.copy(
+                            outcome = OrderOutcome.CANCELED,
+                            updatedAt = clock.instant(),
+                        )
+                    }
+                }
+            }
+    }
+
+    override fun reconcilePositionAfter(
+        symbol: String,
+        clientOrderId: String,
+        wait: Duration,
+    ): Mono<BigDecimal> {
+        require(!wait.isNegative) { "Position reconciliation wait must not be negative" }
+        return Mono.delay(wait, scheduler)
+            .then(reconcilePosition(symbol, clientOrderId))
+    }
+
+    override fun executeNormalExit(
+        request: OrderIntentRequest,
+        wait: Duration,
+    ): Mono<NormalExitResolution> {
+        require(!wait.isZero && !wait.isNegative) {
+            "Normal exit wait must be positive"
+        }
+        require(
+            request.role == OrderRole.CLOSE &&
+                request.type == OrderType.LIMIT &&
+                request.timeInForce == OrderTimeInForce.IOC &&
+                request.reduceOnly,
+        ) {
+            "Normal exit requires one reduce-only LIMIT IOC close"
+        }
+        val intent = clientOrderIdFactory.create(request)
+        return Mono.defer {
+            val pending = PendingOrder(intent)
+            symbolCoordinator
+                .recordOwnership(
+                    levelId = intent.levelId,
+                    ownsActiveAttempt = true,
+                    ownsExposure = true,
+                    hasUnresolvedOrder = true,
+                )
+                .then(
+                    symbolCoordinator.submit(
+                        symbol = intent.symbol,
+                        eventId = "normal-exit-intent:${intent.clientOrderId}",
+                    ) {
+                        register(pending)
+                    },
+                )
+                .then(placeNormalExitAndWait(intent, wait))
+                .then(
+                    client
+                        .reconcileOrder(intent.symbol, intent.clientOrderId)
+                        .timeout(requestTimeout, scheduler)
+                        .onErrorResume { error ->
+                            Mono.just(
+                                BinanceOrderReconciliation(
+                                    order = null,
+                                    position = null,
+                                    openClientOrderIds = emptySet(),
+                                    safeDetail = error.javaClass.simpleName,
+                                ),
+                            )
+                        },
+                )
+                .flatMap { reconciliation ->
+                    finalizeNormalExit(pending, reconciliation)
+                }
+        }.cache()
+    }
+
+    private fun placeNormalExitAndWait(
+        intent: OrderIntent,
+        wait: Duration,
+    ): Mono<Void> {
+        val placementTimeout = minOf(requestTimeout, wait)
+        val placement = client
+            .placeOrder(intent.toBinanceRequest())
+            .timeout(placementTimeout, scheduler)
+            .onErrorResume { Mono.empty() }
+            .then()
+        val waitForFills = Mono.delay(wait, scheduler).then()
+        return Mono.`when`(placement, waitForFills)
+    }
+
+    private fun finalizeNormalExit(
+        pending: PendingOrder,
+        reconciliation: BinanceOrderReconciliation,
+    ): Mono<NormalExitResolution> {
+        val intent = pending.intent
+        val reconciledOrder = reconciliation.order
+        val terminalOutcome = reconciledOrder?.let(::classifiedOutcome)
+        val outcome = terminalOutcome ?: orders[intent.clientOrderId]
+            ?.outcome
+            ?.takeIf { candidate ->
+                candidate != OrderOutcome.ACTIVE
+            } ?: OrderOutcome.UNKNOWN
+        val confirmedPositionAmount = reconciliation.position
+            ?.positionAmount
+            ?: reconciledOrder?.let { order ->
+                confirmedPositionAfterFill(intent, order.executedQuantity)
+            }
+            ?: positions[intent.symbol]?.positionAmount
+            ?: checkNotNull(intent.confirmedPositionAmount)
+        val unresolved =
+            outcome == OrderOutcome.UNKNOWN ||
+                intent.clientOrderId in reconciliation.openClientOrderIds
+        pendingOrders.remove(intent.clientOrderId, pending)
+        pending.result.tryEmitValue(
+            OrderResolution(
+                intent = intent,
+                outcome = outcome,
+                source = OrderResolutionSource.REST_RECONCILIATION,
+                exchangeOrderId = reconciledOrder?.orderId,
+                actualFilledQuantity =
+                    reconciledOrder?.executedQuantity ?: BigDecimal.ZERO,
+                averageFilledPrice = reconciledOrder
+                    ?.averagePrice
+                    ?.takeIf { it.signum() > 0 },
+                confirmedPositionAmount = confirmedPositionAmount,
+                reconciliationChecks = 1,
+                reason = if (unresolved) {
+                    ExecutionReasonCode.ORDER_OUTCOME_UNKNOWN
+                } else {
+                    null
+                },
+            ),
+        )
+        reconciliation.position?.let { position ->
+            positions[position.symbol] = ExecutionPositionSnapshot(
+                symbol = position.symbol,
+                positionAmount = position.positionAmount,
+                entryPrice = position.entryPrice,
+                updatedAt = clock.instant(),
+            )
+        }
+        orders.computeIfPresent(intent.clientOrderId) { _, current ->
+            current.copy(
+                actualFilledQuantity =
+                    reconciledOrder?.executedQuantity
+                        ?: current.actualFilledQuantity,
+                outcome = outcome,
+                source = OrderResolutionSource.REST_RECONCILIATION,
+                exchangeOrderId = reconciledOrder?.orderId
+                    ?: current.exchangeOrderId,
+                updatedAt = clock.instant(),
+                reason = if (unresolved) {
+                    ExecutionReasonCode.ORDER_OUTCOME_UNKNOWN
+                } else {
+                    null
+                },
+            )
+        }
+        evidenceRecorder.recordReconciliation(
+            levelId = intent.levelId,
+            symbol = intent.symbol,
+            timestamp = clock.instant(),
+            reconciliation = ReconciliationEvidence(
+                clientOrderId = intent.clientOrderId,
+                attemptNumber = 1,
+                result = if (unresolved) {
+                    ExecutionReasonCode.ORDER_OUTCOME_UNKNOWN.name
+                } else {
+                    outcome.name
+                },
+                exchangeOrderId = reconciledOrder?.orderId,
+                requestedQuantity = intent.confirmedQuantity,
+                filledQuantity = reconciledOrder?.executedQuantity,
+                safeDetail = reconciliation.safeDetail,
+            ),
+        )
+        val safeMode = if (unresolved) {
+            riskService
+                .enterSafeMode(ExecutionReasonCode.ORDER_OUTCOME_UNKNOWN.name)
+                .then()
+        } else {
+            Mono.empty()
+        }
+        val exposure = confirmedPositionAmount.signum() != 0
+        return safeMode
+            .then(
+                symbolCoordinator.recordOwnership(
+                    levelId = intent.levelId,
+                    ownsActiveAttempt = exposure || unresolved,
+                    ownsExposure = exposure,
+                    hasUnresolvedOrder = unresolved,
+                ),
+            )
+            .thenReturn(
+                NormalExitResolution(
+                    intent = intent,
+                    outcome = outcome,
+                    confirmedPositionAmount = confirmedPositionAmount,
+                    hasUnresolvedOrder = unresolved,
+                ),
+            )
+    }
+
     override fun activateTakeProfits(
         confirmation: TakeProfitSetConfirmation,
     ): Mono<Void> {
@@ -303,8 +528,11 @@ class ExecutionService internal constructor(
             .then()
     }
 
-    override fun takeProfitFills(): Flux<TakeProfitFill> =
-        takeProfitFillSink.asFlux()
+    override fun positionReductions(): Flux<PositionReduction> =
+        positionReductionSink.asFlux()
+
+    override fun positionResult(levelId: UUID): PositionNetResult? =
+        attemptAccounting[levelId]?.snapshot()
 
     fun currentState(): ExecutionSnapshot =
         ExecutionSnapshot(
@@ -323,8 +551,11 @@ class ExecutionService internal constructor(
     @PreDestroy
     fun close() {
         subscriptions.dispose()
-        takeProfitFillSink.tryEmitComplete()
+        positionReductionSink.tryEmitComplete()
         activeTakeProfitSets.clear()
+        activeHardStops.clear()
+        attemptAccounting.clear()
+        intents.clear()
         pendingOrders.values.forEach { pending ->
             pending.result.tryEmitError(
                 IllegalStateException("Execution service is shutting down"),
@@ -385,6 +616,7 @@ class ExecutionService internal constructor(
             "Duplicate clientOrderId ${intent.clientOrderId}"
         }
         activeSymbols += intent.symbol
+        intents[intent.clientOrderId] = intent
         orders[intent.clientOrderId] = intent.snapshot(clock.instant())
         evidenceRecorder.recordOrderIntent(
             levelId = intent.levelId,
@@ -592,6 +824,9 @@ class ExecutionService internal constructor(
             )
         }
         val exposure = confirmation.confirmedPositionAmount.signum() != 0
+        if (!confirmation.confirmed) {
+            activeHardStops.remove(intent.levelId)
+        }
         return symbolCoordinator
             .recordOwnership(
                 levelId = intent.levelId,
@@ -1077,9 +1312,15 @@ class ExecutionService internal constructor(
     }
 
     private fun handlePrivateOrder(event: BinanceUserDataEvent.OrderUpdate) {
+        val currentOrder = orders[event.clientOrderId] ?: return
+        recordTradeAccounting(event, currentOrder)
         val pending = pendingOrders[event.clientOrderId]
         if (pending == null) {
-            handleActiveTakeProfit(event)
+            when (currentOrder.role) {
+                OrderRole.TAKE_PROFIT -> handleActiveTakeProfit(event)
+                OrderRole.HARD_STOP -> handleActiveHardStop(event)
+                else -> Unit
+            }
             return
         }
         val outcome = classifiedOutcome(
@@ -1198,17 +1439,97 @@ class ExecutionService internal constructor(
             updatedAt = updatedAt,
         )
         val complete = remainingQuantity.signum() == 0
-        takeProfitFillSink.tryEmitNext(
-            TakeProfitFill(
+        positionReductionSink.tryEmitNext(
+            PositionReduction(
                 levelId = activeSet.levelId,
                 symbol = activeSet.symbol,
                 clientOrderId = clientOrderId,
+                role = OrderRole.TAKE_PROFIT,
                 confirmedRemainingQuantity = remainingQuantity,
-                allTakeProfitsFilled = complete,
+                terminalReason = if (complete) {
+                    LevelReasonCode.TAKE_PROFITS_COMPLETE
+                } else {
+                    null
+                },
+                netResult = attemptAccounting[activeSet.levelId]?.snapshot(),
             ),
         )
         if (complete) {
             activeTakeProfitSets.remove(activeSet.levelId, activeSet)
+        }
+    }
+
+    private fun handleActiveHardStop(
+        event: BinanceUserDataEvent.OrderUpdate,
+    ) {
+        val current = orders[event.clientOrderId] ?: return
+        val activeStop = activeHardStops[current.levelId] ?: return
+        if (activeStop.intent.clientOrderId != event.clientOrderId) {
+            return
+        }
+        val accumulatedFill = maxOf(
+            current.actualFilledQuantity,
+            event.accumulatedFilledQuantity,
+        )
+        val outcome = when (event.orderStatus.uppercase()) {
+            "NEW" -> OrderOutcome.ACTIVE
+            else -> classifiedOutcome(
+                status = event.orderStatus,
+                actualFilledQuantity = accumulatedFill,
+            )
+        }
+        orders[event.clientOrderId] = current.copy(
+            actualFilledQuantity = accumulatedFill,
+            outcome = outcome ?: current.outcome,
+            source = OrderResolutionSource.PRIVATE_STREAM,
+            exchangeOrderId = event.orderId,
+            updatedAt = event.receivedAt,
+        )
+        if (accumulatedFill <= current.actualFilledQuantity) {
+            return
+        }
+        val initialQuantity = activeStop.positionQuantityAtFirstFill
+            ?: maxOf(
+                positions[event.symbol]?.positionAmount?.abs()
+                    ?: BigDecimal.ZERO,
+                accumulatedFill,
+            ).also { quantity ->
+                activeStop.positionQuantityAtFirstFill = quantity
+            }
+        val remainingQuantity = initialQuantity
+            .subtract(accumulatedFill)
+            .max(BigDecimal.ZERO)
+        val remainingPositionAmount = if (
+            activeStop.intent.confirmedPositionAmount?.signum() == -1
+        ) {
+            remainingQuantity.negate()
+        } else {
+            remainingQuantity
+        }
+        positions[event.symbol] = ExecutionPositionSnapshot(
+            symbol = event.symbol,
+            positionAmount = remainingPositionAmount,
+            entryPrice = positions[event.symbol]?.entryPrice ?: BigDecimal.ZERO,
+            updatedAt = event.receivedAt,
+        )
+        val complete = remainingQuantity.signum() == 0
+        positionReductionSink.tryEmitNext(
+            PositionReduction(
+                levelId = current.levelId,
+                symbol = event.symbol,
+                clientOrderId = event.clientOrderId,
+                role = OrderRole.HARD_STOP,
+                confirmedRemainingQuantity = remainingQuantity,
+                terminalReason = if (complete) {
+                    LevelReasonCode.HARD_STOP_FILLED
+                } else {
+                    null
+                },
+                netResult = attemptAccounting[current.levelId]?.snapshot(),
+            ),
+        )
+        if (complete) {
+            activeHardStops.remove(current.levelId, activeStop)
         }
     }
 
@@ -1231,6 +1552,52 @@ class ExecutionService internal constructor(
                 updatedAt = event.receivedAt,
             )
         }
+        recordFunding(event)
+    }
+
+    private fun recordTradeAccounting(
+        event: BinanceUserDataEvent.OrderUpdate,
+        current: OrderExecutionSnapshot,
+    ) {
+        if (
+            !event.executionType.equals("TRADE", ignoreCase = true) ||
+            event.lastFilledQuantity.signum() <= 0
+        ) {
+            return
+        }
+        val intent = intents[event.clientOrderId] ?: return
+        attemptAccounting
+            .computeIfAbsent(current.levelId) { AttemptAccounting() }
+            .recordTrade(intent, event)
+    }
+
+    private fun recordFunding(event: BinanceUserDataEvent.AccountUpdate) {
+        if (!event.reason.equals("FUNDING_FEE", ignoreCase = true)) {
+            return
+        }
+        val activeLevelIds = event.positions
+            .map(BinancePositionUpdate::symbol)
+            .distinct()
+            .flatMap { symbol ->
+                buildList {
+                    activeHardStops.values
+                        .filter { stop -> stop.intent.symbol == symbol }
+                        .mapTo(this) { stop -> stop.intent.levelId }
+                    activeTakeProfitSets.values
+                        .filter { set -> set.symbol == symbol }
+                        .mapTo(this) { set -> set.levelId }
+                }
+            }
+            .distinct()
+        if (activeLevelIds.size != 1) {
+            return
+        }
+        val funding = event.balances.fold(BigDecimal.ZERO) { total, balance ->
+            total.add(balance.balanceChange)
+        }
+        attemptAccounting
+            .computeIfAbsent(activeLevelIds.single()) { AttemptAccounting() }
+            .recordFunding(funding)
     }
 
     private fun complete(
@@ -1526,11 +1893,89 @@ private data class ActiveTakeProfitSet(
     val levelId: UUID,
     val symbol: String,
     val initialPositionAmount: BigDecimal,
-    val clientOrderIds: Set<String>,
+    val intents: List<OrderIntent>,
     var activated: Boolean = false,
     var lastReportedRemainingQuantity: BigDecimal =
         initialPositionAmount.abs(),
+) {
+    val clientOrderIds: Set<String> = intents.mapTo(
+        linkedSetOf(),
+        OrderIntent::clientOrderId,
+    )
+}
+
+private data class ActiveHardStop(
+    val intent: OrderIntent,
+    var positionQuantityAtFirstFill: BigDecimal? = null,
 )
+
+private class AttemptAccounting {
+    private val recordedTrades = mutableSetOf<String>()
+    private var grossPnl = BigDecimal.ZERO
+    private var fees = BigDecimal.ZERO
+    private var funding = BigDecimal.ZERO
+    private var slippage = BigDecimal.ZERO
+    private var grossPnlObserved = false
+    private var feesObserved = false
+    private var slippageObserved = false
+
+    @Synchronized
+    fun recordTrade(
+        intent: OrderIntent,
+        event: BinanceUserDataEvent.OrderUpdate,
+    ) {
+        val identity = "${event.clientOrderId}:${event.tradeId}"
+        if (!recordedTrades.add(identity)) {
+            return
+        }
+        event.commission?.let { commission ->
+            fees = fees.add(commission.abs())
+            feesObserved = true
+        }
+        if (!intent.role.closesExposure) {
+            return
+        }
+        grossPnl = grossPnl.add(event.realizedProfit)
+        grossPnlObserved = true
+        val referencePrice = when (intent.role) {
+            OrderRole.HARD_STOP -> intent.stopPrice
+            else -> intent.price
+        }
+        val fillPrice = event.lastFilledPrice.takeIf { it.signum() > 0 }
+        if (referencePrice != null && fillPrice != null) {
+            val adversePerUnit = when (intent.side) {
+                OrderSide.BUY -> fillPrice.subtract(referencePrice)
+                OrderSide.SELL -> referencePrice.subtract(fillPrice)
+            }.max(BigDecimal.ZERO)
+            slippage = slippage.add(
+                adversePerUnit.multiply(event.lastFilledQuantity),
+            )
+            slippageObserved = true
+        }
+    }
+
+    @Synchronized
+    fun recordFunding(amount: BigDecimal) {
+        funding = funding.add(amount)
+    }
+
+    @Synchronized
+    fun snapshot(): PositionNetResult {
+        val observedGrossPnl = grossPnl.takeIf { grossPnlObserved }
+        val observedFees = fees.takeIf { feesObserved }
+        return PositionNetResult(
+            grossPnl = observedGrossPnl,
+            fees = observedFees,
+            funding = funding,
+            slippage = slippage.takeIf { slippageObserved },
+            netPnl = if (observedGrossPnl != null && observedFees != null) {
+                observedGrossPnl.subtract(observedFees).add(funding)
+            } else {
+                null
+            },
+        )
+    }
+}
 
 private const val MAX_RECONCILIATION_CHECKS = 3
 private const val MAX_STOP_RECONCILIATION_CHECKS = 50
