@@ -405,6 +405,32 @@ class LiveAuthenticatedBinanceClient(
             }
     }
 
+    override fun reconcileAccount(): Mono<BinanceAccountReconciliation> {
+        val positions = signedGet(POSITION_RISK_PATH)
+            .map { payload ->
+                if (payload.isArray) {
+                    payload.mapNotNull(::parsePositionRisk)
+                } else {
+                    emptyList()
+                }
+            }
+        val openOrders = signedGet(OPEN_ORDERS_PATH)
+            .map { payload ->
+                if (payload.isArray) {
+                    payload.map(::parseOrderStatus)
+                } else {
+                    emptyList()
+                }
+            }
+        return Mono.zip(positions, openOrders)
+            .map { result ->
+                BinanceAccountReconciliation(
+                    positions = result.t1,
+                    openOrders = result.t2,
+                )
+            }
+    }
+
     private fun signedGet(
         path: String,
         parameters: LinkedHashMap<String, String> = linkedMapOf(),
@@ -579,6 +605,17 @@ class LiveAuthenticatedBinanceClient(
                 entryPrice = position.requiredDecimal("entryPrice"),
             )
         }
+    }
+
+    private fun parsePositionRisk(payload: JsonNode): BinancePositionRisk? {
+        if (payload.requiredText("positionSide") != "BOTH") {
+            return null
+        }
+        return BinancePositionRisk(
+            symbol = payload.requiredText("symbol"),
+            positionAmount = payload.requiredDecimal("positionAmt"),
+            entryPrice = payload.requiredDecimal("entryPrice"),
+        )
     }
 
     private fun validateOrderRequest(request: BinanceOrderRequest) {

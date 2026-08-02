@@ -1,10 +1,12 @@
 package com.scalpsecta.breakoutbot.execution
 
+import com.scalpsecta.breakoutbot.binance.BinanceAccountReconciliation
 import com.scalpsecta.breakoutbot.binance.BinanceExecutionClient
 import com.scalpsecta.breakoutbot.binance.BinanceOrderReconciliation
 import com.scalpsecta.breakoutbot.binance.BinanceOrderRequest
 import com.scalpsecta.breakoutbot.binance.BinanceOrderStatus
 import com.scalpsecta.breakoutbot.binance.BinancePositionUpdate
+import com.scalpsecta.breakoutbot.binance.BinancePositionRisk
 import com.scalpsecta.breakoutbot.binance.BinanceUserDataEvent
 import com.scalpsecta.breakoutbot.evidence.AuditEventType
 import com.scalpsecta.breakoutbot.evidence.AuditRecordDraft
@@ -13,6 +15,7 @@ import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
 import com.scalpsecta.breakoutbot.evidence.OrderEvidence
 import com.scalpsecta.breakoutbot.evidence.QuantityEvidence
 import com.scalpsecta.breakoutbot.evidence.ReconciliationEvidence
+import com.scalpsecta.breakoutbot.failure.RequiredDataHealthGate
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
 import com.scalpsecta.breakoutbot.level.LevelReasonCode
 import com.scalpsecta.breakoutbot.level.PositionNetResult
@@ -30,6 +33,7 @@ import reactor.core.publisher.Sinks
 import reactor.core.scheduler.Scheduler
 import reactor.core.scheduler.Schedulers
 import java.math.BigDecimal
+import java.nio.charset.StandardCharsets
 import java.time.Clock
 import java.time.Duration
 import java.util.UUID
@@ -50,6 +54,7 @@ class ExecutionService internal constructor(
     private val requestTimeout: Duration,
     private val reconciliationInterval: Duration,
     private val stopConfirmationTimeout: Duration = Duration.ofSeconds(2),
+    private val entryDataHealthy: (String) -> Boolean = { true },
 ) : PreEntryOrderExecutor, BreakoutOrderExecutor {
     @Autowired
     constructor(
@@ -66,6 +71,7 @@ class ExecutionService internal constructor(
         reconciliationInterval: Duration,
         @Value("\${bot.execution.stop-confirmation-timeout:2s}")
         stopConfirmationTimeout: Duration,
+        requiredDataHealthGate: RequiredDataHealthGate,
     ) : this(
         client = client,
         privateEvents = readinessService.events(),
@@ -78,6 +84,7 @@ class ExecutionService internal constructor(
         requestTimeout = requestTimeout,
         reconciliationInterval = reconciliationInterval,
         stopConfirmationTimeout = stopConfirmationTimeout,
+        entryDataHealthy = requiredDataHealthGate::entriesAndAdditionsAllowed,
     )
 
     private val pendingOrders = ConcurrentHashMap<String, PendingOrder>()
@@ -90,6 +97,8 @@ class ExecutionService internal constructor(
         ConcurrentHashMap<UUID, ActiveTakeProfitSet>()
     private val activeHardStops = ConcurrentHashMap<UUID, ActiveHardStop>()
     private val attemptAccounting = ConcurrentHashMap<UUID, AttemptAccounting>()
+    private val directCloseOperations =
+        ConcurrentHashMap<String, Mono<OrderResolution>>()
     private val positionReductionSink = Sinks
         .many()
         .multicast()
@@ -192,6 +201,61 @@ class ExecutionService internal constructor(
             )
             Mono.just(position.positionAmount)
         }
+
+    fun reconcileRuntime(): Mono<ExecutionRuntimeReconciliation> =
+        client
+            .reconcileAccount()
+            .timeout(requestTimeout, scheduler)
+            .flatMap(::resolveUnknownOrdersFromReconciliation)
+
+    fun closeAccountPositions(
+        reconciledPositions: List<BinancePositionRisk>,
+        operationId: String,
+    ): Mono<List<OrderResolution>> {
+        require(operationId.isNotBlank()) { "operationId must not be blank" }
+        return Flux
+            .fromIterable(
+                reconciledPositions
+                    .filter { position -> position.positionAmount.signum() != 0 }
+                    .sortedBy(BinancePositionRisk::symbol),
+            )
+            .concatMap { position ->
+                val operationKey = "$operationId:${position.symbol}"
+                directCloseOperations.computeIfAbsent(operationKey) {
+                    directMarketClose(position, operationId).cache()
+                }
+            }
+            .collectList()
+    }
+
+    fun cancelBotOrders(
+        openOrders: List<BinanceOrderStatus>,
+        retainHardStops: Boolean,
+    ): Mono<Boolean> {
+        val activeHardStopIds = if (retainHardStops) {
+            activeHardStops.values
+                .mapTo(mutableSetOf()) { stop -> stop.intent.clientOrderId }
+        } else {
+            emptySet()
+        }
+        return Flux
+            .fromIterable(
+                openOrders
+                    .filter { order ->
+                        order.clientOrderId.matches(BOT_CLIENT_ORDER_ID) &&
+                            order.clientOrderId !in activeHardStopIds
+                    }
+                    .sortedBy(BinanceOrderStatus::clientOrderId),
+            )
+            .concatMap { order ->
+                client
+                    .cancelOrder(order.symbol, order.clientOrderId)
+                    .timeout(requestTimeout, scheduler)
+                    .thenReturn(true)
+                    .onErrorReturn(false)
+            }
+            .all { canceled -> canceled }
+    }
 
     override fun confirmTakeProfits(
         requests: List<OrderIntentRequest>,
@@ -540,6 +604,7 @@ class ExecutionService internal constructor(
             entriesAndAdditionsBlocked =
                 riskService.currentState().globalTradingState !=
                     GlobalTradingState.RUNNING ||
+                    activeSymbols.any { symbol -> !entryDataHealthy(symbol) } ||
                     orders.values.any { order ->
                         order.outcome == OrderOutcome.UNKNOWN
                     },
@@ -555,6 +620,7 @@ class ExecutionService internal constructor(
         activeTakeProfitSets.clear()
         activeHardStops.clear()
         attemptAccounting.clear()
+        directCloseOperations.clear()
         intents.clear()
         pendingOrders.values.forEach { pending ->
             pending.result.tryEmitError(
@@ -571,12 +637,15 @@ class ExecutionService internal constructor(
         Mono.defer {
             if (
                 !intent.role.closesExposure &&
-                riskService.currentState().globalTradingState !=
-                GlobalTradingState.RUNNING
+                (
+                    riskService.currentState().globalTradingState !=
+                        GlobalTradingState.RUNNING ||
+                        !entryDataHealthy(intent.symbol)
+                    )
             ) {
                 return@defer Mono.error(
                     OrderExecutionException(
-                        "Entries and additions are blocked in SAFE_MODE",
+                        "Entries and additions are blocked by runtime health",
                     ),
                 )
             }
@@ -603,6 +672,195 @@ class ExecutionService internal constructor(
                     finalizeResolution(resolution, closeOnUnknown)
                 }
         }
+
+    private fun resolveUnknownOrdersFromReconciliation(
+        account: BinanceAccountReconciliation,
+    ): Mono<ExecutionRuntimeReconciliation> {
+        val reconciledPositions = ConcurrentHashMap<String, BinancePositionRisk>()
+        account.positions.forEach { position ->
+            reconciledPositions[position.symbol] = position
+            positions[position.symbol] = ExecutionPositionSnapshot(
+                symbol = position.symbol,
+                positionAmount = position.positionAmount,
+                entryPrice = position.entryPrice,
+                updatedAt = clock.instant(),
+            )
+        }
+        val unknownOrders = orders.values
+            .filter { order -> order.outcome == OrderOutcome.UNKNOWN }
+            .sortedBy(OrderExecutionSnapshot::intentSequence)
+        return Flux
+            .fromIterable(unknownOrders)
+            .concatMap { unknown ->
+                client
+                    .reconcileOrder(unknown.symbol, unknown.clientOrderId)
+                    .timeout(requestTimeout, scheduler)
+                    .doOnNext { reconciliation ->
+                        reconciliation.position?.let { position ->
+                            reconciledPositions[position.symbol] = position
+                            positions[position.symbol] = ExecutionPositionSnapshot(
+                                symbol = position.symbol,
+                                positionAmount = position.positionAmount,
+                                entryPrice = position.entryPrice,
+                                updatedAt = clock.instant(),
+                            )
+                        }
+                        val order = reconciliation.order ?: return@doOnNext
+                        val outcome = classifiedOutcome(order) ?: return@doOnNext
+                        orders.computeIfPresent(unknown.clientOrderId) { _, current ->
+                            current.copy(
+                                actualFilledQuantity = order.executedQuantity,
+                                outcome = outcome,
+                                source = OrderResolutionSource.REST_RECONCILIATION,
+                                exchangeOrderId = order.orderId,
+                                updatedAt = clock.instant(),
+                                reason = null,
+                            )
+                        }
+                    }
+                    .onErrorResume { Mono.empty() }
+            }
+            .then(
+                Mono.fromCallable {
+                    val openBotOrders = account.openOrders.filter { order ->
+                        order.clientOrderId.matches(BOT_CLIENT_ORDER_ID)
+                    }
+                    ExecutionRuntimeReconciliation(
+                        observedAt = clock.instant(),
+                        positions = reconciledPositions.values
+                            .filter { position -> position.positionAmount.signum() != 0 }
+                            .sortedBy(BinancePositionRisk::symbol),
+                        openBotOrders = openBotOrders
+                            .sortedBy(BinanceOrderStatus::clientOrderId),
+                        orphanedBotOrderIds = openBotOrders
+                            .map(BinanceOrderStatus::clientOrderId)
+                            .filterTo(sortedSetOf()) { clientOrderId ->
+                                !intents.containsKey(clientOrderId)
+                            },
+                        unresolvedOrderIds = buildSet {
+                            addAll(pendingOrders.keys)
+                            orders.values
+                                .filter { order -> order.outcome == OrderOutcome.UNKNOWN }
+                                .mapTo(this, OrderExecutionSnapshot::clientOrderId)
+                        },
+                    )
+                },
+            )
+    }
+
+    private fun directMarketClose(
+        position: BinancePositionRisk,
+        operationId: String,
+    ): Mono<OrderResolution> {
+        val levelId = UUID.nameUUIDFromBytes(
+            "$operationId:${position.symbol}"
+                .toByteArray(StandardCharsets.UTF_8),
+        )
+        val intent = clientOrderIdFactory.create(
+            OrderIntentRequest(
+                levelId = levelId,
+                attemptNumber = 1,
+                symbol = position.symbol,
+                role = OrderRole.SAFE_MODE_CLOSE,
+                slot = 0,
+                side = if (position.positionAmount.signum() > 0) {
+                    OrderSide.SELL
+                } else {
+                    OrderSide.BUY
+                },
+                type = OrderType.MARKET,
+                confirmedQuantity = position.positionAmount.abs(),
+                reduceOnly = true,
+                confirmedPositionAmount = position.positionAmount,
+            ),
+        )
+        return Mono.fromRunnable<Void> { recordIntent(intent) }
+            .then(
+                client
+                    .placeOrder(intent.toBinanceRequest())
+                    .timeout(requestTimeout, scheduler)
+                    .onErrorResume { Mono.empty() }
+                    .then(),
+            )
+            .then(reconcileDirectClose(intent, position))
+    }
+
+    private fun reconcileDirectClose(
+        intent: OrderIntent,
+        originalPosition: BinancePositionRisk,
+    ): Mono<OrderResolution> =
+        Flux
+            .range(1, MAX_RECONCILIATION_CHECKS)
+            .concatMap { attempt ->
+                val delay = if (attempt == 1) Duration.ZERO else reconciliationInterval
+                Mono
+                    .delay(delay, scheduler)
+                    .then(client.reconcileOrder(intent.symbol, intent.clientOrderId))
+                    .timeout(requestTimeout, scheduler)
+                    .onErrorReturn(
+                        BinanceOrderReconciliation(
+                            order = null,
+                            position = null,
+                            openClientOrderIds = emptySet(),
+                            safeDetail = "RECONCILIATION_FAILED",
+                        ),
+                    )
+                    .map { reconciliation ->
+                        val position = reconciliation.position ?: originalPosition
+                        val outcome = reconciliation.order
+                            ?.let(::classifiedOutcome)
+                            ?: if (position.positionAmount.signum() == 0) {
+                                OrderOutcome.FILLED
+                            } else {
+                                OrderOutcome.UNKNOWN
+                            }
+                        val terminal =
+                            outcome != OrderOutcome.UNKNOWN ||
+                                attempt == MAX_RECONCILIATION_CHECKS
+                        DirectCloseCheck(
+                            terminal = terminal,
+                            resolution = OrderResolution(
+                                intent = intent,
+                                outcome = outcome,
+                                source = OrderResolutionSource.REST_RECONCILIATION,
+                                exchangeOrderId = reconciliation.order?.orderId,
+                                actualFilledQuantity = reconciliation.order
+                                    ?.executedQuantity ?: BigDecimal.ZERO,
+                                averageFilledPrice = reconciliation.order
+                                    ?.averagePrice
+                                    ?.takeIf { price -> price.signum() > 0 },
+                                confirmedPositionAmount = position.positionAmount,
+                                reconciliationChecks = attempt,
+                                reason = if (outcome == OrderOutcome.UNKNOWN) {
+                                    ExecutionReasonCode.ORDER_OUTCOME_UNKNOWN
+                                } else {
+                                    null
+                                },
+                            ),
+                            position = position,
+                        )
+                    }
+            }
+            .filter(DirectCloseCheck::terminal)
+            .next()
+            .map { check ->
+                val resolution = check.resolution
+                positions[intent.symbol] = ExecutionPositionSnapshot(
+                    symbol = check.position.symbol,
+                    positionAmount = check.position.positionAmount,
+                    entryPrice = check.position.entryPrice,
+                    updatedAt = clock.instant(),
+                )
+                orders[intent.clientOrderId] = orders.getValue(intent.clientOrderId).copy(
+                    actualFilledQuantity = resolution.actualFilledQuantity,
+                    outcome = resolution.outcome,
+                    source = resolution.source,
+                    exchangeOrderId = resolution.exchangeOrderId,
+                    updatedAt = clock.instant(),
+                    reason = resolution.reason,
+                )
+                resolution
+            }
 
     private fun register(pending: PendingOrder) {
         check(pendingOrders.putIfAbsent(pending.intent.clientOrderId, pending) == null) {
@@ -1873,6 +2131,12 @@ class ExecutionService internal constructor(
             reduceOnly = reduceOnly,
         )
 }
+
+private data class DirectCloseCheck(
+    val terminal: Boolean,
+    val resolution: OrderResolution,
+    val position: BinancePositionRisk,
+)
 
 private data class PendingOrder(
     val intent: OrderIntent,

@@ -207,6 +207,7 @@ private const val BASE_36 = 36
 private const val LEVEL_ID_LENGTH = 7
 private const val MAX_CLIENT_ORDER_ID_LENGTH = 36
 private val BINANCE_CLIENT_ORDER_ID = Regex("^[.A-Za-z0-9_:/-]{1,36}$")
+internal val BOT_CLIENT_ORDER_ID = Regex("^b[0-9a-z]+-[0-9a-z]+-.*$")
 private val STOP_ORDER_TYPES = setOf(
     OrderType.STOP,
     OrderType.STOP_MARKET,

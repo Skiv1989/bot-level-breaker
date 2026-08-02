@@ -43,8 +43,6 @@ internal class BreakoutStateMachine {
     private var lastTradePrice: BigDecimal? = null
     private var oppositeFlowSince: Instant? = null
     private var collapsedAccelerationSince: Instant? = null
-    private var publicDataUnhealthySince: Instant? = null
-    private var privateDataUnhealthySince: Instant? = null
     private var oppositeDeltaSince: Instant? = null
     private var crossed = false
 
@@ -67,8 +65,6 @@ internal class BreakoutStateMachine {
         breakoutConfirmedAt = null
         oppositeFlowSince = null
         collapsedAccelerationSince = null
-        publicDataUnhealthySince = null
-        privateDataUnhealthySince = null
         oppositeDeltaSince = null
         crossed = false
     }
@@ -106,18 +102,6 @@ internal class BreakoutStateMachine {
 
             observation.signal.burst.status == BurstStatus.ACTIVE ->
                 LevelReasonCode.PRE_ENTRY_INVALIDATED
-
-            persisted(
-                publicDataUnhealthySince,
-                observation.observedAt,
-                DATA_FAILURE_DURATION,
-            ) -> LevelReasonCode.MARKET_DATA_FAILURE
-
-            persisted(
-                privateDataUnhealthySince,
-                observation.observedAt,
-                DATA_FAILURE_DURATION,
-            ) -> LevelReasonCode.PRIVATE_STREAM_FAILURE
 
             includeNoCrossTimeout &&
                 !crossed &&
@@ -240,16 +224,6 @@ internal class BreakoutStateMachine {
                 signal.acceleration.tradesPerSecondRatio < BigDecimal.ONE &&
                     signal.acceleration.volumeRateRatio < BigDecimal.ONE,
             existing = collapsedAccelerationSince,
-            anchor = anchor,
-        )
-        publicDataUnhealthySince = continuousSince(
-            condition = !observation.publicDataHealthy,
-            existing = publicDataUnhealthySince,
-            anchor = anchor,
-        )
-        privateDataUnhealthySince = continuousSince(
-            condition = !observation.privateDataHealthy,
-            existing = privateDataUnhealthySince,
             anchor = anchor,
         )
         oppositeDeltaSince = continuousSince(
@@ -377,7 +351,6 @@ private fun reached(
 
 private val FLOW_FAILURE_DURATION: Duration = Duration.ofMillis(500)
 private val ACCELERATION_FAILURE_DURATION: Duration = Duration.ofMillis(500)
-private val DATA_FAILURE_DURATION: Duration = Duration.ofSeconds(3)
 private val NO_CROSS_TIMEOUT: Duration = Duration.ofSeconds(5)
 private val CONFIRMATION_DURATION: Duration = Duration.ofSeconds(1)
 private val SNAPBACK_WINDOW: Duration = Duration.ofMillis(500)

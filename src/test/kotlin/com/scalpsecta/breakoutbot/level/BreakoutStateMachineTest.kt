@@ -103,7 +103,7 @@ class BreakoutStateMachineTest {
     }
 
     @Test
-    fun `every immediate and data pre-break invalidation has a stable reason`() {
+    fun `immediate pre-break invalidations stay local while data outages are centralized`() {
         assertThat(
             machine().evaluatePreBreak(
                 observation(0, signal(price = "99.79")),
@@ -133,34 +133,20 @@ class BreakoutStateMachineTest {
         ).isEqualTo(LevelReasonCode.PRE_ENTRY_INVALIDATED)
 
         val marketFailure = machine()
-        marketFailure.evaluatePreBreak(
-            observation(0, publicHealthy = false),
-            includeNoCrossTimeout = true,
-        )
         assertThat(
             marketFailure.evaluatePreBreak(
-                observation(2_999, publicHealthy = false),
-                includeNoCrossTimeout = true,
+                observation(10_000, publicHealthy = false),
+                includeNoCrossTimeout = false,
             ),
         ).isNull()
-        assertThat(
-            marketFailure.evaluatePreBreak(
-                observation(3_000, publicHealthy = false),
-                includeNoCrossTimeout = true,
-            ),
-        ).isEqualTo(LevelReasonCode.MARKET_DATA_FAILURE)
 
         val privateFailure = machine()
-        privateFailure.evaluatePreBreak(
-            observation(0, privateHealthy = false),
-            includeNoCrossTimeout = true,
-        )
         assertThat(
             privateFailure.evaluatePreBreak(
-                observation(3_000, privateHealthy = false),
-                includeNoCrossTimeout = true,
+                observation(10_000, privateHealthy = false),
+                includeNoCrossTimeout = false,
             ),
-        ).isEqualTo(LevelReasonCode.PRIVATE_STREAM_FAILURE)
+        ).isNull()
     }
 
     @Test

@@ -1,6 +1,7 @@
 package com.scalpsecta.breakoutbot.execution
 
 import com.scalpsecta.breakoutbot.binance.BinanceBalanceUpdate
+import com.scalpsecta.breakoutbot.binance.BinanceAccountReconciliation
 import com.scalpsecta.breakoutbot.binance.BinanceExecutionClient
 import com.scalpsecta.breakoutbot.binance.BinanceOrderAcknowledgement
 import com.scalpsecta.breakoutbot.binance.BinanceOrderReconciliation
@@ -57,6 +58,102 @@ class ExecutionServiceTest {
         assertThat(first.clientOrderId.length).isLessThanOrEqualTo(36)
         assertThat(first.intentSequence).isEqualTo(1)
         assertThat(second.intentSequence).isEqualTo(2)
+    }
+
+    @Test
+    fun `unhealthy required data blocks an entry at the final dispatch boundary`() {
+        val harness = harness(entryDataHealthy = false)
+
+        assertThatThrownBy {
+            harness.service.execute(entryRequest()).block(TIMEOUT)
+        }
+            .isInstanceOf(OrderExecutionException::class.java)
+            .hasMessageContaining("runtime health")
+        assertThat(harness.client.placements).isEmpty()
+    }
+
+    @Test
+    fun `runtime reconciliation surfaces unexplained bot orders from signed REST`() {
+        val harness = harness()
+        harness.client.onAccountReconcile = {
+            Mono.just(
+                BinanceAccountReconciliation(
+                    positions = listOf(
+                        BinancePositionRisk(
+                            symbol = SYMBOL,
+                            positionAmount = BigDecimal("0.30"),
+                            entryPrice = BigDecimal("100.50"),
+                        ),
+                    ),
+                    openOrders = listOf(
+                        BinanceOrderStatus(
+                            symbol = SYMBOL,
+                            clientOrderId = "babc-123-1",
+                            orderId = 9001L,
+                            status = "NEW",
+                            originalQuantity = BigDecimal("0.30"),
+                            executedQuantity = BigDecimal.ZERO,
+                            averagePrice = BigDecimal.ZERO,
+                            reduceOnly = true,
+                            closePosition = false,
+                            updatedAt = EVENT_AT,
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        val reconciliation = harness.service.reconcileRuntime().block(TIMEOUT)!!
+
+        assertThat(reconciliation.positions).hasSize(1)
+        assertThat(reconciliation.orphanedBotOrderIds)
+            .containsExactly("babc-123-1")
+    }
+
+    @Test
+    fun `account flatten places one idempotent reduce only market close`() {
+        val harness = harness()
+        harness.client.onReconcile = { symbol, clientOrderId ->
+            Mono.just(
+                BinanceOrderReconciliation(
+                    order = BinanceOrderStatus(
+                        symbol = symbol,
+                        clientOrderId = clientOrderId,
+                        orderId = 9002L,
+                        status = "FILLED",
+                        originalQuantity = BigDecimal("0.30"),
+                        executedQuantity = BigDecimal("0.30"),
+                        averagePrice = BigDecimal("100.40"),
+                        reduceOnly = true,
+                        closePosition = false,
+                        updatedAt = EVENT_AT,
+                    ),
+                    position = BinancePositionRisk(
+                        symbol = symbol,
+                        positionAmount = BigDecimal.ZERO,
+                        entryPrice = BigDecimal.ZERO,
+                    ),
+                    openClientOrderIds = emptySet(),
+                ),
+            )
+        }
+        val position = BinancePositionRisk(
+            symbol = SYMBOL,
+            positionAmount = BigDecimal("0.30"),
+            entryPrice = BigDecimal("100.50"),
+        )
+
+        harness.service
+            .closeAccountPositions(listOf(position), "manual-lock:1")
+            .block(TIMEOUT)
+        harness.service
+            .closeAccountPositions(listOf(position), "manual-lock:1")
+            .block(TIMEOUT)
+
+        val request = harness.client.placements.single()
+        assertThat(request.type).isEqualTo(OrderType.MARKET.name)
+        assertThat(request.reduceOnly).isTrue()
+        assertThat(request.quantity).isEqualByComparingTo("0.30")
     }
 
     @Test
@@ -681,7 +778,9 @@ class ExecutionServiceTest {
             .hasMessageContaining("reduce-only or close-position")
     }
 
-    private fun harness(): ExecutionHarness {
+    private fun harness(
+        entryDataHealthy: Boolean = true,
+    ): ExecutionHarness {
         val events = Sinks.many().multicast().onBackpressureBuffer<BinanceUserDataEvent>()
         val client = FakeBinanceExecutionClient()
         val coordinator = ImmediateSymbolExecutionCoordinator()
@@ -704,6 +803,7 @@ class ExecutionServiceTest {
             requestTimeout = Duration.ofMillis(10),
             reconciliationInterval = Duration.ofMillis(10),
             stopConfirmationTimeout = Duration.ofMillis(100),
+            entryDataHealthy = { entryDataHealthy },
         )
         resources += AutoCloseable {
             service.close()
@@ -961,6 +1061,14 @@ private class FakeBinanceExecutionClient : BinanceExecutionClient {
                 ),
             )
         }
+    var onAccountReconcile: () -> Mono<BinanceAccountReconciliation> = {
+        Mono.just(
+            BinanceAccountReconciliation(
+                positions = emptyList(),
+                openOrders = emptyList(),
+            ),
+        )
+    }
 
     override fun placeOrder(
         request: BinanceOrderRequest,
@@ -982,6 +1090,9 @@ private class FakeBinanceExecutionClient : BinanceExecutionClient {
         clientOrderId: String,
     ): Mono<BinanceOrderReconciliation> =
         onReconcile(symbol, clientOrderId)
+
+    override fun reconcileAccount(): Mono<BinanceAccountReconciliation> =
+        onAccountReconcile()
 }
 
 private class ImmediateSymbolExecutionCoordinator : SymbolExecutionCoordinator {

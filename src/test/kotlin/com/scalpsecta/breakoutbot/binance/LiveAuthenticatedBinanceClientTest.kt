@@ -291,6 +291,69 @@ class LiveAuthenticatedBinanceClientTest {
     }
 
     @Test
+    fun `signed account reconciliation loads one-way exposure and open orders`() {
+        val exchange = RecordingExchange { request ->
+            when (request.url().path) {
+                "/fapi/v3/positionRisk" -> response(
+                    body =
+                        """
+                        [
+                          {
+                            "symbol":"BTCUSDT",
+                            "positionSide":"BOTH",
+                            "positionAmt":"0.180",
+                            "entryPrice":"65432.10"
+                          },
+                          {
+                            "symbol":"BTCUSDT",
+                            "positionSide":"LONG",
+                            "positionAmt":"0.500",
+                            "entryPrice":"65000.00"
+                          }
+                        ]
+                        """.trimIndent(),
+                )
+
+                "/fapi/v1/openOrders" -> response(
+                    body =
+                        """
+                        [{
+                          "symbol":"BTCUSDT",
+                          "clientOrderId":"babc-123-1",
+                          "orderId":99,
+                          "status":"NEW",
+                          "origQty":"0.180",
+                          "executedQty":"0",
+                          "avgPrice":"0",
+                          "reduceOnly":true,
+                          "closePosition":false,
+                          "updateTime":1785496333456
+                        }]
+                        """.trimIndent(),
+                )
+
+                else -> error(
+                    "Unexpected request: ${request.method()} ${request.url()}",
+                )
+            }
+        }
+        val client = client(exchange) as BinanceExecutionClient
+
+        val reconciliation = client.reconcileAccount().block()!!
+
+        val position = reconciliation.positions.single()
+        assertThat(position.symbol).isEqualTo("BTCUSDT")
+        assertThat(position.positionAmount).isEqualByComparingTo("0.180")
+        assertThat(reconciliation.openOrders.single().clientOrderId)
+            .isEqualTo("babc-123-1")
+        assertThat(exchange.requests).allSatisfy { request ->
+            assertThat(request.headers().getFirst("X-MBX-APIKEY"))
+                .isEqualTo("test-api-key")
+            assertThat(request.url().query).contains("signature=")
+        }
+    }
+
+    @Test
     fun `execution client sends close-all contract-price stop without price protection`() {
         val exchange = RecordingExchange {
             response(

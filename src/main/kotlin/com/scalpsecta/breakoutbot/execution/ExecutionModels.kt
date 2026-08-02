@@ -1,5 +1,7 @@
 package com.scalpsecta.breakoutbot.execution
 
+import com.scalpsecta.breakoutbot.binance.BinanceOrderStatus
+import com.scalpsecta.breakoutbot.binance.BinancePositionRisk
 import reactor.core.publisher.Mono
 import java.math.BigDecimal
 import java.time.Instant
@@ -56,6 +58,7 @@ enum class OrderRole(
     TAKE_PROFIT('t', true),
     CLOSE('c', true),
     UNKNOWN_OUTCOME_CLOSE('u', true),
+    SAFE_MODE_CLOSE('m', true),
 }
 
 enum class OrderSide {
@@ -133,6 +136,14 @@ data class ExecutionSnapshot(
     val positions: List<ExecutionPositionSnapshot>,
     val balances: List<ExecutionBalanceSnapshot>,
     val orders: List<OrderExecutionSnapshot>,
+)
+
+data class ExecutionRuntimeReconciliation(
+    val observedAt: Instant,
+    val positions: List<BinancePositionRisk>,
+    val openBotOrders: List<BinanceOrderStatus>,
+    val orphanedBotOrderIds: Set<String>,
+    val unresolvedOrderIds: Set<String>,
 )
 
 data class ExecutionPositionSnapshot(

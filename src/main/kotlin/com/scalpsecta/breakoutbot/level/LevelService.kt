@@ -440,6 +440,33 @@ class LevelService internal constructor(
         netResult = netResult,
     )
 
+    internal fun claimFailureExit(
+        levelId: UUID,
+        reason: LevelReasonCode,
+        reconciledPositionAmount: BigDecimal,
+    ): Mono<BreakoutExitRequest?> {
+        require(
+            reason == LevelReasonCode.MARKET_DATA_FAILURE ||
+                reason == LevelReasonCode.PRIVATE_STREAM_FAILURE,
+        ) {
+            "Failure exits require a public or private data failure reason"
+        }
+        return submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.ClaimFailureExit(
+                    levelId = levelId,
+                    reason = reason,
+                    reconciledPositionAmount = reconciledPositionAmount,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).map { result ->
+            (result as FailureExitClaim).request
+        }
+    }
+
     private fun submitTermination(
         levelId: UUID,
         reason: LevelReasonCode,
@@ -551,6 +578,9 @@ class LevelService internal constructor(
 
                 is SymbolLevelEvent.PositionReduced ->
                     recordPositionReduction(event)
+
+                is SymbolLevelEvent.ClaimFailureExit ->
+                    claimFailureExit(event)
 
                 is SymbolLevelEvent.AggregateTrade -> {
                     evidenceRecorder.record(event.event)
@@ -1337,6 +1367,52 @@ class LevelService internal constructor(
         }
     }
 
+    private fun claimFailureExit(
+        event: SymbolLevelEvent.ClaimFailureExit,
+    ): FailureExitClaim {
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        val before = stored.snapshot
+        if (
+            !before.ownsExposure ||
+            before.state == LevelState.EXITING ||
+            before.state == LevelState.TERMINAL
+        ) {
+            return FailureExitClaim(null)
+        }
+        stored.snapshot = before.copy(
+            confirmedPositionQuantity = event.reconciledPositionAmount.abs(),
+        )
+        transitionToExiting(stored, event.processedAt, event.reason)
+        val after = currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        )
+        stored.snapshot = after
+        recordStateTransition(before, after, event.publicMarketData)
+        return FailureExitClaim(
+            BreakoutExitRequest(
+                requestId =
+                    "failure:${event.reason.name}:${event.levelId}",
+                levelId = after.id,
+                attemptNumber = after.attemptNumber,
+                symbol = after.symbol,
+                direction = after.direction,
+                confirmedPositionQuantity = after.confirmedPositionQuantity,
+                reason = event.reason,
+                bestBidPrice = after.signal.bidPrice,
+                bestAskPrice = after.signal.askPrice,
+                frozenNpu = after.signal.npu.absolute,
+                tickSize = stored.tickSize,
+            ),
+        )
+    }
+
     private fun advanceBreakout(
         stored: StoredLevel,
         processedAt: Instant,
@@ -1545,7 +1621,13 @@ class LevelService internal constructor(
         stored: StoredLevel,
         publicMarketData: PublicMarketDataSnapshot?,
     ): Boolean {
-        val snapshot = stored.snapshot
+        val snapshot = currentSnapshot(
+            stored = stored,
+            publicMarketData = publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+        )
+        stored.snapshot = snapshot
         return snapshot.attemptConsumed &&
             snapshot.ownsActiveAttempt &&
             snapshot.ownsExposure &&
@@ -2745,6 +2827,14 @@ private sealed interface SymbolLevelEvent {
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent
 
+    data class ClaimFailureExit(
+        val levelId: UUID,
+        val reason: LevelReasonCode,
+        val reconciledPositionAmount: BigDecimal,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
     data class AggregateTrade(
         val event: AggregateTradeEvent,
         val processedAt: Instant,
@@ -2771,6 +2861,10 @@ private sealed interface SymbolLevelEvent {
         val action: () -> Any,
     ) : SymbolLevelEvent
 }
+
+private data class FailureExitClaim(
+    val request: BreakoutExitRequest?,
+)
 
 private fun levelError(
     code: LevelReasonCode,

@@ -93,6 +93,8 @@ data class GlobalRiskSnapshot(
     val remainingDailyCapacity: BigDecimal?,
     val openSymbolCount: Int,
     val activeAttemptSymbolCount: Int,
+    val safeModeEventCount: Int,
+    val safeModeEventTimes: List<Instant>,
     val attempts: List<RiskAttemptSnapshot>,
     val reservations: List<RiskReservationSnapshot>,
 )

@@ -16,6 +16,13 @@ interface BinanceExecutionClient {
         symbol: String,
         clientOrderId: String,
     ): Mono<BinanceOrderReconciliation>
+
+    fun reconcileAccount(): Mono<BinanceAccountReconciliation> =
+        Mono.error(
+            IllegalStateException(
+                "Binance account reconciliation is unavailable until a live execution adapter is configured",
+            ),
+        )
 }
 
 data class BinanceOrderRequest(
@@ -70,6 +77,12 @@ data class BinanceOrderReconciliation(
     val order: BinanceOrderStatus?,
     val position: BinancePositionRisk?,
     val openClientOrderIds: Set<String>,
+    val safeDetail: String? = null,
+)
+
+data class BinanceAccountReconciliation(
+    val positions: List<BinancePositionRisk>,
+    val openOrders: List<BinanceOrderStatus>,
     val safeDetail: String? = null,
 )
 

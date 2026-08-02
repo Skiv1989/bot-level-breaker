@@ -21,6 +21,7 @@ import java.math.BigDecimal
 import java.math.MathContext
 import java.math.RoundingMode
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
@@ -47,6 +48,7 @@ class AttemptRiskService internal constructor(
     private var latestAccountState: RiskAccountState? = null
     private var globalTradingState = GlobalTradingState.RUNNING
     private var stateReason: String? = null
+    private val safeModeEvents = ArrayDeque<Instant>()
     private var nextSequence = 1L
     private val publishedState = AtomicReference(emptySnapshot(clock.instant()))
     private val queue = OrderedGlobalRiskQueue<RiskEvent>(scheduler, ::handle)
@@ -93,7 +95,19 @@ class AttemptRiskService internal constructor(
     fun enterSafeMode(reason: String): Mono<GlobalRiskSnapshot> {
         require(reason.isNotBlank()) { "reason must not be blank" }
         return queue
-            .submit(RiskEvent.EnterSafeMode(reason))
+            .submit(RiskEvent.EnterSafeMode(reason, clock.instant()))
+            .map { result -> result as GlobalRiskSnapshot }
+    }
+
+    fun recoverFromSafeMode(): Mono<GlobalRiskSnapshot> =
+        queue
+            .submit(RiskEvent.RecoverFromSafeMode(clock.instant()))
+            .map { result -> result as GlobalRiskSnapshot }
+
+    fun enterManualLock(reason: String): Mono<GlobalRiskSnapshot> {
+        require(reason.isNotBlank()) { "reason must not be blank" }
+        return queue
+            .submit(RiskEvent.EnterManualLock(reason, clock.instant()))
             .map { result -> result as GlobalRiskSnapshot }
     }
 
@@ -112,14 +126,55 @@ class AttemptRiskService internal constructor(
             is RiskEvent.ConfirmedReducingFill -> confirmReducingFill(event)
             is RiskEvent.ConfirmedFlat -> confirmFlat(event)
             is RiskEvent.EnterSafeMode -> enterSafeMode(event)
+            is RiskEvent.RecoverFromSafeMode -> recoverFromSafeMode(event)
+            is RiskEvent.EnterManualLock -> enterManualLock(event)
         }
 
     private fun enterSafeMode(
         event: RiskEvent.EnterSafeMode,
     ): GlobalRiskSnapshot {
-        globalTradingState = GlobalTradingState.SAFE_MODE
+        pruneSafeModeEvents(event.enteredAt)
+        if (
+            globalTradingState != GlobalTradingState.SAFE_MODE &&
+            globalTradingState != GlobalTradingState.MANUAL_LOCK
+        ) {
+            safeModeEvents.addLast(event.enteredAt)
+            if (safeModeEvents.size >= SAFE_MODE_ESCALATION_COUNT) {
+                globalTradingState = GlobalTradingState.MANUAL_LOCK
+                stateReason = SAFE_MODE_ESCALATION_REASON
+            } else {
+                globalTradingState = GlobalTradingState.SAFE_MODE
+                stateReason = event.reason
+            }
+        }
+        return publishState()
+    }
+
+    private fun recoverFromSafeMode(
+        event: RiskEvent.RecoverFromSafeMode,
+    ): GlobalRiskSnapshot {
+        pruneSafeModeEvents(event.recoveredAt)
+        if (globalTradingState == GlobalTradingState.SAFE_MODE) {
+            globalTradingState = GlobalTradingState.RUNNING
+            stateReason = null
+        }
+        return publishState()
+    }
+
+    private fun enterManualLock(
+        event: RiskEvent.EnterManualLock,
+    ): GlobalRiskSnapshot {
+        pruneSafeModeEvents(event.enteredAt)
+        globalTradingState = GlobalTradingState.MANUAL_LOCK
         stateReason = event.reason
         return publishState()
+    }
+
+    private fun pruneSafeModeEvents(now: Instant) {
+        val cutoff = now.minus(SAFE_MODE_ROLLING_WINDOW)
+        while (safeModeEvents.firstOrNull()?.isBefore(cutoff) == true) {
+            safeModeEvents.removeFirst()
+        }
     }
 
     private fun admit(event: RiskEvent.Admit): AttemptAdmissionDecision {
@@ -665,6 +720,7 @@ class AttemptRiskService internal constructor(
         snapshot(clock.instant()).also(publishedState::set)
 
     private fun snapshot(now: Instant): GlobalRiskSnapshot {
+        pruneSafeModeEvents(now)
         val accountState = latestAccountState
         val openRisk = reservedRisk(RiskReservationStatus.OPEN_POSITION)
         val pendingRisk = reservedRisk(RiskReservationStatus.PENDING_ATTEMPT)
@@ -699,6 +755,8 @@ class AttemptRiskService internal constructor(
                 .map(MutableRiskReservation::symbol)
                 .toSet()
                 .size,
+            safeModeEventCount = safeModeEvents.size,
+            safeModeEventTimes = safeModeEvents.toList(),
             attempts = attempts.values
                 .sortedBy(MutableRiskAttempt::sequence)
                 .map(MutableRiskAttempt::snapshot),
@@ -762,6 +820,16 @@ private sealed interface RiskEvent {
 
     data class EnterSafeMode(
         val reason: String,
+        val enteredAt: Instant,
+    ) : RiskEvent
+
+    data class RecoverFromSafeMode(
+        val recoveredAt: Instant,
+    ) : RiskEvent
+
+    data class EnterManualLock(
+        val reason: String,
+        val enteredAt: Instant,
     ) : RiskEvent
 }
 
@@ -831,6 +899,8 @@ private fun emptySnapshot(now: Instant): GlobalRiskSnapshot =
         remainingDailyCapacity = null,
         openSymbolCount = 0,
         activeAttemptSymbolCount = 0,
+        safeModeEventCount = 0,
+        safeModeEventTimes = emptyList(),
         attempts = emptyList(),
         reservations = emptyList(),
     )
@@ -838,6 +908,9 @@ private fun emptySnapshot(now: Instant): GlobalRiskSnapshot =
 private val MATH_CONTEXT = MathContext.DECIMAL128
 private const val MAXIMUM_LEVERAGE = 20
 private const val MAXIMUM_ACTIVE_SYMBOLS = 5
+private const val SAFE_MODE_ESCALATION_COUNT = 3
+private const val SAFE_MODE_ESCALATION_REASON = "SAFE_MODE_ESCALATION"
+private val SAFE_MODE_ROLLING_WINDOW: Duration = Duration.ofMinutes(15)
 private val ONE_HUNDRED = BigDecimal("100")
 private val THREE = BigDecimal("3")
 private val ONE_PERCENT = BigDecimal("0.01")
