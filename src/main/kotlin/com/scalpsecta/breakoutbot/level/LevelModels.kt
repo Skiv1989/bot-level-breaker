@@ -1,5 +1,6 @@
 package com.scalpsecta.breakoutbot.level
 
+import com.scalpsecta.breakoutbot.execution.BreakoutExitRequest
 import com.scalpsecta.breakoutbot.signal.LevelSignalSnapshot
 import java.math.BigDecimal
 import java.time.Instant
@@ -11,6 +12,11 @@ data class CreateLevelCommand(
     val levelPrice: BigDecimal,
     val positionNotionalUsdt: BigDecimal,
     val maxImpulsePct: BigDecimal,
+)
+
+data class ManualCloseClaim(
+    val level: LevelSnapshot?,
+    val request: BreakoutExitRequest?,
 )
 
 enum class LevelDirection {
@@ -158,6 +164,8 @@ enum class LevelReasonCode {
     HARD_STOP_FILLED,
     TAKE_PROFITS_COMPLETE,
     DAILY_LOSS_LIMIT,
+    MANUAL_CLOSE,
+    KILL_SWITCH,
 }
 
 class LevelException(

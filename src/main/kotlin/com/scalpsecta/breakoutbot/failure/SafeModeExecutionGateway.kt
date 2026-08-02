@@ -251,16 +251,16 @@ class LiveSafeModeExecutionGateway(
                     executionService.closeAccountPositions(
                         reconciledPositions = reconciliation.positions,
                         operationId = operationId,
-                    )
+                    ).then(reconcile())
                 }
             }
-            .flatMap { resolutions ->
-                val accountFlat = resolutions.all { resolution ->
-                    resolution.confirmedPositionAmount.signum() == 0
-                }
-                if (accountFlat) {
+            .flatMap { confirmed ->
+                if (confirmed.positions.isEmpty()) {
+                    val confirmedExecution = checkNotNull(confirmed.execution) {
+                        "Live account flattening requires a final execution reconciliation"
+                    }
                     executionService.cancelBotOrders(
-                        openOrders = execution.openBotOrders,
+                        openOrders = confirmedExecution.openBotOrders,
                         retainHardStops = false,
                     ).flatMap { canceled ->
                         if (!canceled) {
@@ -272,7 +272,7 @@ class LiveSafeModeExecutionGateway(
                         } else if (terminalReason == null) {
                             Mono.empty()
                         } else {
-                            synchronizeDailyFlat(terminalReason)
+                            synchronizeConfirmedFlat(terminalReason)
                         }
                     }
                 } else {
@@ -281,7 +281,7 @@ class LiveSafeModeExecutionGateway(
             }
     }
 
-    private fun synchronizeDailyFlat(
+    private fun synchronizeConfirmedFlat(
         terminalReason: LevelReasonCode,
     ): Mono<Void> {
         val levelsById = levels().associateBy(LevelSnapshot::id)

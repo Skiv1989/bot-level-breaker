@@ -178,6 +178,36 @@ class OperatorSecurityIntegrationTest {
                 body = VALID_LEVEL_REQUEST,
             )
             assertThat(missingTokenResponse.statusCode()).isEqualTo(403)
+            assertThat(
+                application.objectMapper.readTree(missingTokenResponse.body())["code"]
+                    .asText(),
+            ).isEqualTo("SECURITY_POLICY_VIOLATION")
+
+            val commandId = UUID.randomUUID()
+            val crossOriginCommand = application.post(
+                path = "/api/controls/unlock",
+                cookie = cookiePair,
+                csrfToken = csrfToken,
+                body = """{"commandId":"$commandId"}""",
+                origin = "https://untrusted.example",
+            )
+            assertThat(crossOriginCommand.statusCode()).isEqualTo(403)
+            assertThat(
+                application.objectMapper.readTree(crossOriginCommand.body())["code"]
+                    .asText(),
+            ).isEqualTo("SAME_ORIGIN_REQUIRED")
+
+            val validCommand = application.post(
+                path = "/api/controls/unlock",
+                cookie = cookiePair,
+                csrfToken = csrfToken,
+                body = """{"commandId":"$commandId"}""",
+            )
+            assertThat(validCommand.statusCode()).isEqualTo(200)
+            assertThat(
+                application.objectMapper.readTree(validCommand.body())["code"]
+                    .asText(),
+            ).isEqualTo("MANUAL_UNLOCK_REJECTED")
 
             val validTokenResponse = application.post(
                 path = "/api/levels",
@@ -201,6 +231,10 @@ class OperatorSecurityIntegrationTest {
             )
             assertThat(populated["levelCount"].asInt()).isOne()
             assertThat(populated["levels"]).hasSize(1)
+            assertThat(populated["controls"]["commands"]).hasSize(1)
+            assertThat(
+                populated["controls"]["commands"][0]["code"].asText(),
+            ).isEqualTo("MANUAL_UNLOCK_REJECTED")
 
             val deleteResponse = application.delete(
                 path = "/api/levels/${createdLevel["id"].asText()}",
@@ -373,6 +407,7 @@ class OperatorSecurityIntegrationTest {
         cookie: String? = null,
         csrfToken: String? = null,
         body: String = "",
+        origin: String = "${baseUri.scheme}://${baseUri.authority}",
     ): HttpResponse<String> {
         val request = HttpRequest
             .newBuilder(baseUri.resolve(path))
@@ -380,7 +415,7 @@ class OperatorSecurityIntegrationTest {
                 "Authorization",
                 basicAuthorization(OPERATOR_USERNAME, OPERATOR_PASSWORD),
             )
-            .header("Origin", "${baseUri.scheme}://${baseUri.authority}")
+            .header("Origin", origin)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
         if (cookie != null) {

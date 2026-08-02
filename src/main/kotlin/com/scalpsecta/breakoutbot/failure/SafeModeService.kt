@@ -26,10 +26,13 @@ data class SafeModeSnapshot(
     val entriesAndAdditionsBlocked: Boolean,
     val publicDataHealthy: Boolean,
     val privateStreamHealthy: Boolean,
+    val accountHealthy: Boolean,
+    val clockHealthy: Boolean,
     val publicDataUnhealthySince: Instant?,
     val privateStreamUnhealthySince: Instant?,
     val recoveryHealthySince: Instant?,
     val matchingReconciliationCount: Int,
+    val recoveryHealthDurationSatisfied: Boolean,
     val safeModeEventCount: Int,
     val globalTradingState: GlobalTradingState,
 )
@@ -88,10 +91,9 @@ class SafeModeService internal constructor(
             val authenticated = authenticatedBinanceReadinessService.snapshot()
             FailureRuntimeHealth(
                 publicDataHealthy =
-                    symbols.isNotEmpty() &&
-                        symbols.all { symbol ->
-                            publicSnapshots[symbol]?.healthy == true
-                        },
+                    symbols.all { symbol ->
+                        publicSnapshots[symbol]?.healthy == true
+                    },
                 privateStreamHealthy =
                     authenticated.privateStream.readiness ==
                         BinanceReadiness.READY,
@@ -176,6 +178,13 @@ class SafeModeService internal constructor(
                 attemptDue(lastManualLockAttemptAt, now) ->
                 flattenForManualLock(now, health)
 
+            globalState == GlobalTradingState.MANUAL_LOCK &&
+                manualLockFlattened &&
+                health.publicDataHealthy &&
+                health.privateStreamHealthy &&
+                reconciliationDue(now) ->
+                evaluateManualLockEvidence(now, health)
+
             failureReason(now) != null ->
                 handleFailure(checkNotNull(failureReason(now)), now, health)
 
@@ -226,9 +235,10 @@ class SafeModeService internal constructor(
 
         val streamsHealthy =
             health.publicDataHealthy && health.privateStreamHealthy
+        val recoveryState = riskService.currentState().globalTradingState
         if (
-            riskService.currentState().globalTradingState ==
-            GlobalTradingState.SAFE_MODE && streamsHealthy
+            recoveryState in RECOVERY_EVIDENCE_STATES &&
+            streamsHealthy
         ) {
             recoveryHealthySince = recoveryHealthySince ?: now
         } else {
@@ -329,6 +339,16 @@ class SafeModeService internal constructor(
             }
             .then(Mono.fromSupplier { publish(health) })
 
+    private fun evaluateManualLockEvidence(
+        now: Instant,
+        health: FailureRuntimeHealth,
+    ): Mono<SafeModeSnapshot> = executionGateway
+        .reconcile()
+        .doOnNext { reconciliation ->
+            recordReconciliation(reconciliation, now)
+        }
+        .then(Mono.fromSupplier { publish(health) })
+
     private fun flattenForManualLock(
         now: Instant,
         health: FailureRuntimeHealth,
@@ -427,10 +447,18 @@ class SafeModeService internal constructor(
                     GlobalTradingState.RUNNING,
             publicDataHealthy = health.publicDataHealthy,
             privateStreamHealthy = health.privateStreamHealthy,
+            accountHealthy = health.accountHealthy,
+            clockHealthy = health.clockHealthy,
             publicDataUnhealthySince = publicDataUnhealthySince,
             privateStreamUnhealthySince = privateStreamUnhealthySince,
             recoveryHealthySince = recoveryHealthySince,
             matchingReconciliationCount = matchingReconciliationCount,
+            recoveryHealthDurationSatisfied =
+                recoveryHealthySince?.let { healthySince ->
+                    !clock.instant().isBefore(
+                        healthySince.plus(recoveryHealthDuration),
+                    )
+                } == true,
             safeModeEventCount = riskService.currentState().safeModeEventCount,
             globalTradingState = riskService.currentState().globalTradingState,
         ).also(publishedState::set)
@@ -441,10 +469,13 @@ class SafeModeService internal constructor(
             entriesAndAdditionsBlocked = true,
             publicDataHealthy = false,
             privateStreamHealthy = false,
+            accountHealthy = false,
+            clockHealthy = false,
             publicDataUnhealthySince = null,
             privateStreamUnhealthySince = null,
             recoveryHealthySince = null,
             matchingReconciliationCount = 0,
+            recoveryHealthDurationSatisfied = false,
             safeModeEventCount = 0,
             globalTradingState = GlobalTradingState.RUNNING,
         )
@@ -457,4 +488,8 @@ private fun exceeded(
 ): Boolean = since != null && now.isAfter(since.plus(duration))
 
 private const val REQUIRED_MATCHING_RECONCILIATIONS = 3
+private val RECOVERY_EVIDENCE_STATES = setOf(
+    GlobalTradingState.SAFE_MODE,
+    GlobalTradingState.MANUAL_LOCK,
+)
 private val logger = KotlinLogging.logger {}

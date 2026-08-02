@@ -5,6 +5,7 @@ import com.scalpsecta.breakoutbot.domain.ApplicationRun
 import com.scalpsecta.breakoutbot.domain.RuntimeHealth
 import com.scalpsecta.breakoutbot.domain.RuntimeSnapshot
 import com.scalpsecta.breakoutbot.domain.TradingReadiness
+import com.scalpsecta.breakoutbot.control.OperatorControlService
 import com.scalpsecta.breakoutbot.evidence.EvidenceService
 import com.scalpsecta.breakoutbot.execution.ExecutionService
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
@@ -22,6 +23,7 @@ class BotStateService(
     private val attemptRiskService: AttemptRiskService,
     private val evidenceService: EvidenceService,
     private val executionService: ExecutionService,
+    private val operatorControlService: OperatorControlService,
     private val applicationRun: ApplicationRun,
 ) {
     fun currentState(): RuntimeSnapshot {
@@ -52,6 +54,7 @@ class BotStateService(
             risk = risk,
             evidence = evidenceService.currentSnapshot(),
             execution = executionService.currentState(),
+            controls = operatorControlService.currentState(),
             health = RuntimeHealth(
                 publicDataReadiness = publicDataReadiness,
                 privateStreamReadiness = privateStreamReadiness,

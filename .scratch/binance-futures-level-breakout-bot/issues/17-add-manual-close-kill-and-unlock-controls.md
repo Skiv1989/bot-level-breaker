@@ -10,11 +10,11 @@
 
 ## Acceptance criteria
 
-- [ ] Per-position close blocks additions for the symbol, uses the normal reduce-only close flow, confirms flat state, records `MANUAL_CLOSE`, and leaves the owning level terminal.
-- [ ] The global kill switch atomically blocks entries, cancels pending entries and required TPs, market-closes every account position reduce-only, retains each hard stop until flat, records `KILL_SWITCH`, and enters `MANUAL_LOCK`.
-- [ ] Unlock succeeds only when the account is flat and runtime health/reconciliation requirements pass; it does not recreate levels lost on restart.
-- [ ] Every command is serialized through its owning symbol or global queue and is idempotent under duplicate browser submission.
-- [ ] Mutations require Basic Auth, same-origin access, and a valid CSRF token and return stable machine codes plus human-readable explanations.
-- [ ] Level deletion becomes available only after the close command has confirmed there is no exposure or unresolved order.
-- [ ] Audit and snapshot output make command progress, blockers, residual exposure, global state, and final outcome observable.
-- [ ] Fake-exchange tests cover partial close, residual reconciliation, duplicate kill, unlock rejection, and successful unlock.
+- [x] Per-position close blocks additions for the symbol, uses the normal reduce-only close flow, confirms flat state, records `MANUAL_CLOSE`, and leaves the owning level terminal.
+- [x] The global kill switch atomically blocks entries, cancels pending entries and required TPs, market-closes every account position reduce-only, retains each hard stop until flat, records `KILL_SWITCH`, and enters `MANUAL_LOCK`.
+- [x] Unlock succeeds only when the account is flat and runtime health/reconciliation requirements pass; it does not recreate levels lost on restart.
+- [x] Every command is serialized through its owning symbol or global queue and is idempotent under duplicate browser submission.
+- [x] Mutations require Basic Auth, same-origin access, and a valid CSRF token and return stable machine codes plus human-readable explanations.
+- [x] Level deletion becomes available only after the close command has confirmed there is no exposure or unresolved order.
+- [x] Audit and snapshot output make command progress, blockers, residual exposure, global state, and final outcome observable.
+- [x] Fake-exchange tests cover partial close, residual reconciliation, duplicate kill, unlock rejection, and successful unlock.

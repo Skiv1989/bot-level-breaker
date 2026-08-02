@@ -38,6 +38,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
 class LevelServiceTest {
@@ -276,6 +277,50 @@ class LevelServiceTest {
         assertThat(service.delete(created.id).block()!!.id).isEqualTo(created.id)
         assertThat(service.currentState()).isEmpty()
         assertThat(marketDataService.activeSymbolCount()).isZero()
+    }
+
+    @Test
+    fun `manual close claim is serialized and deletion waits for confirmed flat`() {
+        val created = service.create(command()).block()!!
+        service.recordOwnership(
+            levelId = created.id,
+            ownsActiveAttempt = true,
+            ownsExposure = true,
+            hasUnresolvedOrder = false,
+        ).block()
+
+        val claim = service.claimManualClose(
+            symbol = created.symbol,
+            commandId = UUID.randomUUID(),
+            reconciledPositionAmount = BigDecimal("0.30"),
+        ).block()!!
+        val duplicate = service.claimManualClose(
+            symbol = created.symbol,
+            commandId = UUID.randomUUID(),
+            reconciledPositionAmount = BigDecimal("0.30"),
+        ).block()!!
+
+        assertThat(claim.request).isNotNull
+        assertThat(claim.request!!.reason)
+            .isEqualTo(LevelReasonCode.MANUAL_CLOSE)
+        assertThat(claim.level!!.state).isEqualTo(LevelState.EXITING)
+        assertThat(claim.level!!.deleteAllowed).isFalse()
+        assertThat(duplicate.request).isNull()
+
+        service.terminatePosition(
+            levelId = created.id,
+            reason = LevelReasonCode.MANUAL_CLOSE,
+            confirmedRemainingQuantity = BigDecimal.ZERO,
+            hasUnresolvedOrder = false,
+            netResult = null,
+        ).block()
+
+        val terminal = service.currentState().single()
+        assertThat(terminal.state).isEqualTo(LevelState.TERMINAL)
+        assertThat(terminal.terminalReason)
+            .isEqualTo(LevelReasonCode.MANUAL_CLOSE)
+        assertThat(terminal.deleteAllowed).isTrue()
+        assertThat(service.delete(created.id).block()!!.id).isEqualTo(created.id)
     }
 
     @Test

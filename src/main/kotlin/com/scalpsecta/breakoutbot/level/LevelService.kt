@@ -467,6 +467,24 @@ class LevelService internal constructor(
         }
     }
 
+    fun claimManualClose(
+        symbol: String,
+        commandId: UUID,
+        reconciledPositionAmount: BigDecimal,
+    ): Mono<ManualCloseClaim> {
+        val normalizedSymbol = symbol.trim().uppercase()
+        return submitSymbolEventResult(
+            symbol = normalizedSymbol,
+            event = SymbolLevelEvent.ClaimManualClose(
+                symbol = normalizedSymbol,
+                commandId = commandId,
+                reconciledPositionAmount = reconciledPositionAmount,
+                processedAt = clock.instant(),
+                publicMarketData = currentPublicMarketData(normalizedSymbol),
+            ),
+        ).map { result -> result as ManualCloseClaim }
+    }
+
     private fun submitTermination(
         levelId: UUID,
         reason: LevelReasonCode,
@@ -581,6 +599,9 @@ class LevelService internal constructor(
 
                 is SymbolLevelEvent.ClaimFailureExit ->
                     claimFailureExit(event)
+
+                is SymbolLevelEvent.ClaimManualClose ->
+                    claimManualClose(event)
 
                 is SymbolLevelEvent.AggregateTrade -> {
                     evidenceRecorder.record(event.event)
@@ -1405,6 +1426,79 @@ class LevelService internal constructor(
                 direction = after.direction,
                 confirmedPositionQuantity = after.confirmedPositionQuantity,
                 reason = event.reason,
+                bestBidPrice = after.signal.bidPrice,
+                bestAskPrice = after.signal.askPrice,
+                frozenNpu = after.signal.npu.absolute,
+                tickSize = stored.tickSize,
+            ),
+        )
+    }
+
+    private fun claimManualClose(
+        event: SymbolLevelEvent.ClaimManualClose,
+    ): ManualCloseClaim {
+        val stored = levelsForSymbol(event.symbol)
+            .firstOrNull { candidate ->
+                candidate.snapshot.ownsExposure ||
+                    candidate.snapshot.confirmedPositionQuantity.signum() != 0 ||
+                    candidate.snapshot.state == LevelState.EXITING
+            }
+            ?: return ManualCloseClaim(
+                level = levelsForSymbol(event.symbol)
+                    .firstOrNull { candidate ->
+                        candidate.snapshot.state == LevelState.TERMINAL &&
+                            candidate.snapshot.terminalReason ==
+                            LevelReasonCode.MANUAL_CLOSE
+                    }
+                    ?.snapshot,
+                request = null,
+            )
+        val before = stored.snapshot
+        if (
+            before.state == LevelState.EXITING ||
+            before.state == LevelState.TERMINAL
+        ) {
+            return ManualCloseClaim(before, null)
+        }
+        val directionMatches = when (before.direction) {
+            LevelDirection.LONG -> event.reconciledPositionAmount.signum() >= 0
+            LevelDirection.SHORT -> event.reconciledPositionAmount.signum() <= 0
+        }
+        if (!directionMatches) {
+            throw levelError(
+                LevelReasonCode.LEVEL_HAS_EXPOSURE,
+                "Reconciled ${event.symbol} exposure does not match the owning level direction",
+            )
+        }
+        stored.snapshot = before.copy(
+            confirmedPositionQuantity = event.reconciledPositionAmount.abs(),
+            ownsActiveAttempt = true,
+            ownsExposure = event.reconciledPositionAmount.signum() != 0,
+        )
+        transitionToExiting(
+            stored = stored,
+            processedAt = event.processedAt,
+            reason = LevelReasonCode.MANUAL_CLOSE,
+        )
+        val after = currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        )
+        stored.snapshot = after
+        recordStateTransition(before, after, event.publicMarketData)
+        return ManualCloseClaim(
+            level = after,
+            request = BreakoutExitRequest(
+                requestId = "manual-close:${event.commandId}",
+                levelId = after.id,
+                attemptNumber = after.attemptNumber,
+                symbol = after.symbol,
+                direction = after.direction,
+                confirmedPositionQuantity = after.confirmedPositionQuantity,
+                reason = LevelReasonCode.MANUAL_CLOSE,
                 bestBidPrice = after.signal.bidPrice,
                 bestAskPrice = after.signal.askPrice,
                 frozenNpu = after.signal.npu.absolute,
@@ -2830,6 +2924,14 @@ private sealed interface SymbolLevelEvent {
     data class ClaimFailureExit(
         val levelId: UUID,
         val reason: LevelReasonCode,
+        val reconciledPositionAmount: BigDecimal,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class ClaimManualClose(
+        val symbol: String,
+        val commandId: UUID,
         val reconciledPositionAmount: BigDecimal,
         val processedAt: Instant,
         val publicMarketData: PublicMarketDataSnapshot?,

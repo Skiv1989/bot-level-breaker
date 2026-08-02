@@ -187,6 +187,17 @@ class SafeModeServiceTest {
 
         harness.service.evaluateNow().block(TIMEOUT)
         assertThat(harness.gateway.flattenCount).isOne()
+
+        harness.clock.advance(Duration.ofSeconds(1))
+        harness.service.evaluateNow().block(TIMEOUT)
+        harness.clock.advance(Duration.ofSeconds(29))
+        val unlockEvidence = harness.service.evaluateNow().block(TIMEOUT)!!
+
+        assertThat(unlockEvidence.matchingReconciliationCount)
+            .isGreaterThanOrEqualTo(3)
+        assertThat(unlockEvidence.recoveryHealthDurationSatisfied).isTrue()
+        assertThat(unlockEvidence.globalTradingState)
+            .isEqualTo(GlobalTradingState.MANUAL_LOCK)
     }
 
     private fun harness(): SafeModeHarness {

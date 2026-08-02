@@ -152,6 +152,11 @@ class AttemptRiskService internal constructor(
             .map { result -> result as GlobalRiskSnapshot }
     }
 
+    fun unlockManualLock(): Mono<GlobalRiskSnapshot> =
+        queue
+            .submit(RiskEvent.UnlockManualLock(clock.instant()))
+            .map { result -> result as GlobalRiskSnapshot }
+
     fun currentState(): GlobalRiskSnapshot {
         val now = clock.instant()
         val current = publishedState.get()
@@ -190,6 +195,7 @@ class AttemptRiskService internal constructor(
             is RiskEvent.EnterSafeMode -> enterSafeMode(event)
             is RiskEvent.RecoverFromSafeMode -> recoverFromSafeMode(event)
             is RiskEvent.EnterManualLock -> enterManualLock(event)
+            is RiskEvent.UnlockManualLock -> unlockManualLock(event)
         }
 
     private fun enterSafeMode(
@@ -225,6 +231,28 @@ class AttemptRiskService internal constructor(
         pruneSafeModeEvents(event.enteredAt)
         manualLockReason = event.reason
         safeModeReason = null
+        return publishState().also {
+            recordDailyRiskAudit(
+                decision = event.reason,
+                timestamp = event.enteredAt,
+            )
+        }
+    }
+
+    private fun unlockManualLock(
+        event: RiskEvent.UnlockManualLock,
+    ): GlobalRiskSnapshot {
+        if (
+            manualLockReason != null &&
+            dailyLockedAt == null &&
+            safeModeReason == null
+        ) {
+            manualLockReason = null
+            recordDailyRiskAudit(
+                decision = MANUAL_UNLOCK_DECISION,
+                timestamp = event.unlockedAt,
+            )
+        }
         return publishState()
     }
 
@@ -1155,6 +1183,10 @@ private sealed interface RiskEvent {
         val reason: String,
         val enteredAt: Instant,
     ) : RiskEvent
+
+    data class UnlockManualLock(
+        val unlockedAt: Instant,
+    ) : RiskEvent
 }
 
 private data class MutableRiskAttempt(
@@ -1274,6 +1306,7 @@ private const val TEMPORARY_ANCHOR_DECISION =
 private const val DAILY_ROLLOVER_DECISION = "DAILY_ANCHOR_ROLLED_OVER"
 private const val DAILY_BREACH_DECISION = "DAILY_DRAWDOWN_BREACHED"
 private const val ENTRY_COOLDOWN_DECISION = "ENTRY_COOLDOWN_STARTED"
+private const val MANUAL_UNLOCK_DECISION = "MANUAL_UNLOCK"
 private const val GLOBAL_RISK_AUDIT_SYMBOL = "ACCOUNT"
 private const val DAILY_BOUNDARY_HOUR_UTC = 3
 private const val CONSECUTIVE_LOSS_LIMIT = 3

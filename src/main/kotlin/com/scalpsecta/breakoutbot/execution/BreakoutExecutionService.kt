@@ -440,11 +440,16 @@ class BreakoutExecutionService internal constructor(
     ): Mono<BreakoutResult> {
         val confirmedQuantity = confirmedPositionAmount.abs()
         if (confirmedQuantity.signum() == 0) {
-            return finalizeClose(
-                request = request,
-                reason = reason,
+            return updateRiskAfterClose(
+                levelId = request.levelId,
                 remainingQuantity = BigDecimal.ZERO,
-                hasUnresolvedOrder = false,
+            ).then(
+                finalizeClose(
+                    request = request,
+                    reason = reason,
+                    remainingQuantity = BigDecimal.ZERO,
+                    hasUnresolvedOrder = false,
+                ),
             )
         }
         val iocRequest = checkNotNull(
@@ -510,12 +515,17 @@ class BreakoutExecutionService internal constructor(
     ): Mono<BreakoutResult> {
         val confirmedQuantity = confirmedPositionAmount.abs()
         if (confirmedQuantity.signum() == 0) {
-            return finalizeClose(
-                request = request,
-                reason = reason,
+            return updateRiskAfterClose(
+                levelId = request.levelId,
                 remainingQuantity = BigDecimal.ZERO,
-                hasUnresolvedOrder = persistentUnresolvedOrder,
-                additionResolution = additionResolution,
+            ).then(
+                finalizeClose(
+                    request = request,
+                    reason = reason,
+                    remainingQuantity = BigDecimal.ZERO,
+                    hasUnresolvedOrder = persistentUnresolvedOrder,
+                    additionResolution = additionResolution,
+                ),
             )
         }
         return orderExecutor
@@ -886,4 +896,5 @@ private val SOFT_EXIT_REASONS = setOf(
     LevelReasonCode.EXIT_SCORE,
     LevelReasonCode.SNAPBACK,
     LevelReasonCode.MAX_HOLD_TIME,
+    LevelReasonCode.MANUAL_CLOSE,
 )

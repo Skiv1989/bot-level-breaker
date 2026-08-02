@@ -1,6 +1,7 @@
 package com.scalpsecta.breakoutbot.domain
 
 import com.scalpsecta.breakoutbot.binance.AuthenticatedBinanceSnapshot
+import com.scalpsecta.breakoutbot.control.OperatorControlsSnapshot
 import com.scalpsecta.breakoutbot.evidence.EvidenceSnapshot
 import com.scalpsecta.breakoutbot.execution.ExecutionSnapshot
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
@@ -20,6 +21,7 @@ data class RuntimeSnapshot(
     val risk: GlobalRiskSnapshot,
     val evidence: EvidenceSnapshot,
     val execution: ExecutionSnapshot,
+    val controls: OperatorControlsSnapshot,
     val health: RuntimeHealth,
 )
 

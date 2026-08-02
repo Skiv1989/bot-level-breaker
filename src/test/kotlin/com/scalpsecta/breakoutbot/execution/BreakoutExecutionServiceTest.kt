@@ -342,54 +342,64 @@ class BreakoutExecutionServiceTest {
     }
 
     @Test
-    fun `strategy exit uses one capped IOC then market closes one reconciled residual`() {
-        LevelDirection.entries.forEach { direction ->
-            val harness = harness(direction)
-            harness.executor.softExitResidual = BigDecimal("1.2")
-            harness.executor.netResult = PositionNetResult(
-                grossPnl = BigDecimal("-0.40"),
-                fees = BigDecimal("0.10"),
-                funding = BigDecimal("0.02"),
-                slippage = BigDecimal("0.03"),
-                netPnl = BigDecimal("-0.48"),
-            )
+    fun `strategy and manual exits use one capped IOC then market close one reconciled residual`() {
+        listOf(
+            LevelReasonCode.EXIT_SCORE,
+            LevelReasonCode.MANUAL_CLOSE,
+        ).forEach { reason ->
+            LevelDirection.entries.forEach { direction ->
+                val harness = harness(direction)
+                harness.executor.softExitResidual = BigDecimal("1.2")
+                harness.executor.netResult = PositionNetResult(
+                    grossPnl = BigDecimal("-0.40"),
+                    fees = BigDecimal("0.10"),
+                    funding = BigDecimal("0.02"),
+                    slippage = BigDecimal("0.03"),
+                    netPnl = BigDecimal("-0.48"),
+                )
 
-            val result = harness.service.execute(
-                BreakoutExitRequest(
-                    requestId = "exit-score",
-                    levelId = LEVEL_ID,
-                    attemptNumber = 1,
-                    symbol = "BTCUSDT",
-                    direction = direction,
-                    confirmedPositionQuantity = BigDecimal("3"),
-                    reason = LevelReasonCode.EXIT_SCORE,
-                    bestBidPrice = BigDecimal("99.9"),
-                    bestAskPrice = BigDecimal("100.1"),
-                    frozenNpu = BigDecimal("0.1"),
-                    tickSize = BigDecimal("0.1"),
-                ),
-            ).block(TIMEOUT)!!
+                val result = harness.service.execute(
+                    BreakoutExitRequest(
+                        requestId = "exit:${reason.name}",
+                        levelId = LEVEL_ID,
+                        attemptNumber = 1,
+                        symbol = "BTCUSDT",
+                        direction = direction,
+                        confirmedPositionQuantity = BigDecimal("3"),
+                        reason = reason,
+                        bestBidPrice = BigDecimal("99.9"),
+                        bestAskPrice = BigDecimal("100.1"),
+                        frozenNpu = BigDecimal("0.1"),
+                        tickSize = BigDecimal("0.1"),
+                    ),
+                ).block(TIMEOUT)!!
 
-            val closes = harness.executor.requests.filter { request ->
-                request.role == OrderRole.CLOSE
+                val closes = harness.executor.requests.filter { request ->
+                    request.role == OrderRole.CLOSE
+                }
+                assertThat(closes.map(OrderIntentRequest::type))
+                    .containsExactly(OrderType.LIMIT, OrderType.MARKET)
+                assertThat(closes.first().timeInForce)
+                    .isEqualTo(OrderTimeInForce.IOC)
+                assertThat(closes.first().reduceOnly).isTrue()
+                assertThat(closes.first().price).isEqualByComparingTo(
+                    if (direction == LevelDirection.LONG) "99.8" else "100.2",
+                )
+                assertThat(closes.last().confirmedQuantity)
+                    .isEqualByComparingTo("1.2")
+                assertThat(harness.executor.reconciliationWait)
+                    .isEqualTo(Duration.ofMillis(500))
+                assertThat(harness.executor.activeTakeProfitCancellations)
+                    .isEqualTo(1)
+                assertThat(harness.riskService.currentState().reservations)
+                    .isEmpty()
+                assertThat(harness.coordinator.terminations.single().reason)
+                    .isEqualTo(reason)
+                assertThat(harness.coordinator.terminations.single().netResult)
+                    .isEqualTo(harness.executor.netResult)
+                assertThat(result.confirmedPositionQuantity)
+                    .isEqualByComparingTo("0")
             }
-            assertThat(closes.map(OrderIntentRequest::type))
-                .containsExactly(OrderType.LIMIT, OrderType.MARKET)
-            assertThat(closes.first().timeInForce).isEqualTo(OrderTimeInForce.IOC)
-            assertThat(closes.first().reduceOnly).isTrue()
-            assertThat(closes.first().price).isEqualByComparingTo(
-                if (direction == LevelDirection.LONG) "99.8" else "100.2",
-            )
-            assertThat(closes.last().confirmedQuantity).isEqualByComparingTo("1.2")
-            assertThat(harness.executor.reconciliationWait)
-                .isEqualTo(Duration.ofMillis(500))
-            assertThat(harness.executor.activeTakeProfitCancellations).isEqualTo(1)
-            assertThat(harness.riskService.currentState().reservations).isEmpty()
-            assertThat(harness.coordinator.terminations.single().reason)
-                .isEqualTo(LevelReasonCode.EXIT_SCORE)
-            assertThat(harness.coordinator.terminations.single().netResult)
-                .isEqualTo(harness.executor.netResult)
-            assertThat(result.confirmedPositionQuantity).isEqualByComparingTo("0")
         }
     }
 
