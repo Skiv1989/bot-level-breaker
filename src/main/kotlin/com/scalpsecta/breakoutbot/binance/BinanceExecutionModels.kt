@@ -7,6 +7,11 @@ import java.time.Instant
 interface BinanceExecutionClient {
     fun placeOrder(request: BinanceOrderRequest): Mono<BinanceOrderAcknowledgement>
 
+    fun cancelOrder(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<Void>
+
     fun reconcileOrder(
         symbol: String,
         clientOrderId: String,
@@ -47,6 +52,9 @@ data class BinanceOrderStatus(
     val closePosition: Boolean,
     val updatedAt: Instant,
     val type: String? = null,
+    val side: String? = null,
+    val timeInForce: String? = null,
+    val price: BigDecimal? = null,
     val stopPrice: BigDecimal? = null,
     val workingType: String? = null,
     val priceProtect: Boolean? = null,
@@ -72,6 +80,16 @@ class UnavailableBinanceExecutionClient : BinanceExecutionClient {
         Mono.error(
             IllegalStateException(
                 "Binance order placement is unavailable until a live execution adapter is configured",
+            ),
+        )
+
+    override fun cancelOrder(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<Void> =
+        Mono.error(
+            IllegalStateException(
+                "Binance order cancellation is unavailable until a live execution adapter is configured",
             ),
         )
 

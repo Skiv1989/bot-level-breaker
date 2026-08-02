@@ -237,6 +237,169 @@ class ExecutionServiceTest {
     }
 
     @Test
+    fun `complete reduce-only GTC target set is verified by exact identities`() {
+        val harness = harness()
+        harness.client.onReconcile = { _, clientOrderId ->
+            val placement = harness.client.placements.single { request ->
+                request.clientOrderId == clientOrderId
+            }
+            Mono.just(activeTakeProfitReconciliation(placement))
+        }
+
+        val confirmation = harness.service
+            .confirmTakeProfits(
+                takeProfitRequests(),
+                Duration.ofMillis(100),
+            )
+            .block(TIMEOUT)!!
+
+        assertThat(confirmation.confirmed).isTrue()
+        assertThat(confirmation.intents.map(OrderIntent::slot))
+            .containsExactly(1, 2, 3)
+        assertThat(confirmation.intents.map(OrderIntent::clientOrderId))
+            .allSatisfy { clientOrderId ->
+                assertThat(clientOrderId).matches("^[.A-Za-z0-9_:/-]{1,36}$")
+            }
+        assertThat(harness.client.placements).hasSize(3)
+        assertThat(harness.client.placements).allSatisfy { placement ->
+            assertThat(placement.type).isEqualTo("LIMIT")
+            assertThat(placement.timeInForce).isEqualTo("GTC")
+            assertThat(placement.reduceOnly).isTrue()
+            assertThat(placement.closePosition).isFalse()
+        }
+        assertThat(harness.service.currentState().orders)
+            .allSatisfy { order ->
+                assertThat(order.role).isEqualTo(OrderRole.TAKE_PROFIT)
+                assertThat(order.outcome).isEqualTo(OrderOutcome.ACTIVE)
+            }
+    }
+
+    @Test
+    fun `partial exchange target set remains unconfirmed and every fragment is canceled`() {
+        val harness = harness()
+        harness.client.onReconcile = { _, clientOrderId ->
+            val placement = harness.client.placements.single { request ->
+                request.clientOrderId == clientOrderId
+            }
+            if (placement.price == BigDecimal("102.0")) {
+                Mono.just(
+                    BinanceOrderReconciliation(
+                        order = null,
+                        position = BinancePositionRisk(
+                            symbol = SYMBOL,
+                            positionAmount = BigDecimal("0.30"),
+                            entryPrice = BigDecimal("100.0"),
+                        ),
+                        openClientOrderIds = emptySet(),
+                    ),
+                )
+            } else {
+                Mono.just(activeTakeProfitReconciliation(placement))
+            }
+        }
+
+        val confirmation = harness.service
+            .confirmTakeProfits(
+                takeProfitRequests(),
+                Duration.ofMillis(100),
+            )
+            .block(TIMEOUT)!!
+        val cancellationComplete = harness.service
+            .cancelTakeProfits(confirmation.intents)
+            .block(TIMEOUT)!!
+
+        assertThat(confirmation.confirmed).isFalse()
+        assertThat(cancellationComplete).isTrue()
+        assertThat(harness.client.cancellations).hasSize(3)
+        assertThat(harness.service.currentState().orders)
+            .allSatisfy { order ->
+                assertThat(order.outcome).isEqualTo(OrderOutcome.CANCELED)
+            }
+    }
+
+    @Test
+    fun `confirmed target fills shrink exposure while the original hard stop stays unchanged`() {
+        val harness = harness()
+        harness.client.onReconcile = { _, clientOrderId ->
+            val placement = harness.client.placements.single { request ->
+                request.clientOrderId == clientOrderId
+            }
+            if (placement.type == "STOP_MARKET") {
+                Mono.just(
+                    activeHardStopReconciliation(
+                        clientOrderId = clientOrderId,
+                        stopPrice = BigDecimal("99.7"),
+                        workingType = "CONTRACT_PRICE",
+                        priceProtect = false,
+                    ),
+                )
+            } else {
+                Mono.just(activeTakeProfitReconciliation(placement))
+            }
+        }
+        harness.service.confirmHardStop(hardStopRequest()).block(TIMEOUT)
+        val confirmation = harness.service
+            .confirmTakeProfits(
+                takeProfitRequests(),
+                Duration.ofMillis(100),
+            )
+            .block(TIMEOUT)!!
+        harness.service.activateTakeProfits(confirmation).block(TIMEOUT)
+        val fills = mutableListOf<TakeProfitFill>()
+        val fillSubscription = harness.service.takeProfitFills().subscribe(fills::add)
+
+        val placements = confirmation.intents.map { intent ->
+            harness.client.placements.single { request ->
+                request.clientOrderId == intent.clientOrderId
+            }
+        }
+        harness.events.tryEmitNext(
+            orderUpdate(
+                request = placements[0],
+                status = "PARTIALLY_FILLED",
+                filledQuantity = "0.050",
+            ),
+        )
+        harness.events.tryEmitNext(
+            orderUpdate(
+                request = placements[0],
+                status = "FILLED",
+                filledQuantity = "0.099",
+            ),
+        )
+        harness.events.tryEmitNext(
+            orderUpdate(
+                request = placements[1],
+                status = "FILLED",
+                filledQuantity = "0.099",
+            ),
+        )
+        harness.events.tryEmitNext(
+            orderUpdate(
+                request = placements[2],
+                status = "FILLED",
+                filledQuantity = "0.102",
+            ),
+        )
+
+        assertThat(fills.map(TakeProfitFill::confirmedRemainingQuantity))
+            .usingElementComparator(BigDecimal::compareTo)
+            .containsExactly(
+                BigDecimal("0.250"),
+                BigDecimal("0.201"),
+                BigDecimal("0.102"),
+                BigDecimal.ZERO,
+            )
+        assertThat(fills.last().allTakeProfitsFilled).isTrue()
+        val hardStop = harness.service.currentState().orders.single { order ->
+            order.role == OrderRole.HARD_STOP
+        }
+        assertThat(hardStop.stopPrice).isEqualByComparingTo("99.7")
+        assertThat(hardStop.outcome).isEqualTo(OrderOutcome.ACTIVE)
+        fillSubscription.dispose()
+    }
+
+    @Test
     fun `REST reconciliation classifies every resolved terminal outcome`() {
         val harness = harness()
         val cases = listOf(
@@ -473,6 +636,54 @@ class ExecutionServiceTest {
             confirmedPositionAmount = BigDecimal("0.30"),
         )
 
+    private fun takeProfitRequests(): List<OrderIntentRequest> = listOf(
+        BigDecimal("0.099") to BigDecimal("100.7"),
+        BigDecimal("0.099") to BigDecimal("101.4"),
+        BigDecimal("0.102") to BigDecimal("102.0"),
+    ).mapIndexed { index, (quantity, price) ->
+        OrderIntentRequest(
+            levelId = LEVEL_ID,
+            attemptNumber = 1,
+            symbol = SYMBOL,
+            role = OrderRole.TAKE_PROFIT,
+            slot = index + 1,
+            side = OrderSide.SELL,
+            type = OrderType.LIMIT,
+            timeInForce = OrderTimeInForce.GTC,
+            confirmedQuantity = quantity,
+            price = price,
+            reduceOnly = true,
+            confirmedPositionAmount = BigDecimal("0.30"),
+        )
+    }
+
+    private fun activeTakeProfitReconciliation(
+        request: BinanceOrderRequest,
+    ): BinanceOrderReconciliation = BinanceOrderReconciliation(
+        order = BinanceOrderStatus(
+            symbol = SYMBOL,
+            clientOrderId = request.clientOrderId,
+            orderId = 1100L,
+            status = "NEW",
+            originalQuantity = checkNotNull(request.quantity),
+            executedQuantity = BigDecimal.ZERO,
+            averagePrice = BigDecimal.ZERO,
+            reduceOnly = true,
+            closePosition = false,
+            updatedAt = EVENT_AT,
+            type = request.type,
+            side = request.side,
+            timeInForce = request.timeInForce,
+            price = request.price,
+        ),
+        position = BinancePositionRisk(
+            symbol = SYMBOL,
+            positionAmount = BigDecimal("0.30"),
+            entryPrice = BigDecimal("100.0"),
+        ),
+        openClientOrderIds = setOf(request.clientOrderId),
+    )
+
     private fun activeHardStopReconciliation(
         clientOrderId: String,
         stopPrice: BigDecimal,
@@ -596,6 +807,7 @@ private data class ExecutionHarness(
 
 private class FakeBinanceExecutionClient : BinanceExecutionClient {
     val placements = mutableListOf<BinanceOrderRequest>()
+    val cancellations = mutableListOf<Pair<String, String>>()
     val reconciliationCounts = ConcurrentHashMap<String, Int>()
     var onPlace: (BinanceOrderRequest) -> Mono<BinanceOrderAcknowledgement> =
         { request -> Mono.just(request.acknowledgement()) }
@@ -621,6 +833,13 @@ private class FakeBinanceExecutionClient : BinanceExecutionClient {
             placements += request
             onPlace(request)
         }
+
+    override fun cancelOrder(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<Void> = Mono.fromRunnable<Void> {
+        cancellations += symbol to clientOrderId
+    }.then()
 
     override fun reconcileOrder(
         symbol: String,

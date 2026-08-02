@@ -391,6 +391,23 @@ class LevelService internal constructor(
             },
         ).then()
 
+    override fun recordTakeProfitFill(
+        levelId: UUID,
+        confirmedRemainingQuantity: BigDecimal,
+    ): Mono<Void> =
+        submitPreEntryEvent(
+            levelId = levelId,
+            event = { publicMarketData ->
+                SymbolLevelEvent.TakeProfitFilled(
+                    levelId = levelId,
+                    confirmedRemainingQuantity =
+                        confirmedRemainingQuantity,
+                    processedAt = clock.instant(),
+                    publicMarketData = publicMarketData,
+                )
+            },
+        ).then()
+
     override fun terminate(
         levelId: UUID,
         reason: LevelReasonCode,
@@ -496,6 +513,9 @@ class LevelService internal constructor(
 
                 is SymbolLevelEvent.FinalFilled ->
                     recordFinalFill(event)
+
+                is SymbolLevelEvent.TakeProfitFilled ->
+                    recordTakeProfitFill(event)
 
                 is SymbolLevelEvent.AggregateTrade -> {
                     evidenceRecorder.record(event.event)
@@ -710,6 +730,7 @@ class LevelService internal constructor(
             snapshot = snapshot,
             signalTracker = tracker,
             tickSize = event.plan.tickSize,
+            lotSize = event.plan.lotSize,
         )
         levels[snapshot.id] = stored
         return currentSnapshot(
@@ -1196,6 +1217,57 @@ class LevelService internal constructor(
         }
     }
 
+    private fun recordTakeProfitFill(
+        event: SymbolLevelEvent.TakeProfitFilled,
+    ): LevelSnapshot {
+        require(event.confirmedRemainingQuantity.signum() >= 0) {
+            "confirmedRemainingQuantity must not be negative"
+        }
+        val stored = levels[event.levelId] ?: throw levelError(
+            LevelReasonCode.LEVEL_NOT_FOUND,
+            "Level ${event.levelId} does not exist",
+        )
+        val before = stored.snapshot
+        check(before.state == LevelState.POSITION_MANAGEMENT) {
+            "Level ${event.levelId} is not managing a confirmed position"
+        }
+        require(
+            event.confirmedRemainingQuantity <
+                before.confirmedPositionQuantity,
+        ) {
+            "A take-profit fill must reduce confirmed exposure"
+        }
+        stored.snapshot = if (event.confirmedRemainingQuantity.signum() == 0) {
+            before.copy(
+                state = LevelState.TERMINAL,
+                stateChangedAt = event.processedAt,
+                terminalReason = LevelReasonCode.TAKE_PROFITS_COMPLETE,
+                confirmedPositionQuantity = BigDecimal.ZERO,
+                ownsActiveAttempt = false,
+                ownsExposure = false,
+                hasUnresolvedOrder = false,
+                deleteAllowed = true,
+            )
+        } else {
+            before.copy(
+                confirmedPositionQuantity =
+                    event.confirmedRemainingQuantity,
+                ownsExposure = true,
+                deleteAllowed = false,
+            )
+        }
+        return currentSnapshot(
+            stored = stored,
+            publicMarketData = event.publicMarketData,
+            privateStreamReadiness = privateStreamReadinessProvider(),
+            globalState = globalTradingStateProvider(),
+            now = event.processedAt,
+        ).also { after ->
+            stored.snapshot = after
+            recordStateTransition(before, after, event.publicMarketData)
+        }
+    }
+
     private fun advanceBreakout(
         stored: StoredLevel,
         processedAt: Instant,
@@ -1410,6 +1482,12 @@ class LevelService internal constructor(
             frozenNpu = snapshot.signal.npu.absolute ?: return null,
             hardStopClientOrderId = snapshot.hardStopClientOrderId ?: return null,
             hardStopPrice = snapshot.hardStopPrice ?: return null,
+            levelPrice = snapshot.normalizedLevelPrice,
+            maxImpulsePct = snapshot.maxImpulsePct,
+            tickSize = stored.tickSize,
+            quantityStepSize = stored.lotSize.stepSize,
+            minimumQuantity = stored.lotSize.minimumQuantity,
+            maximumQuantity = stored.lotSize.maximumQuantity,
         )
     }
 
@@ -1645,7 +1723,7 @@ class LevelService internal constructor(
             LevelState.CROSS_ENTRY_PENDING -> "CROSSING_TRADE"
             LevelState.BREAK_CONFIRM -> "CROSSING_FILL_RESOLVED"
             LevelState.CONFIRM_ENTRY_PENDING -> "BREAKOUT_CONFIRMED"
-            LevelState.POSITION_MANAGEMENT -> "FINAL_TRANCHE_FILLED"
+            LevelState.POSITION_MANAGEMENT -> "TAKE_PROFITS_CONFIRMED"
             LevelState.EXITING ->
                 after.terminalReason?.name ?: "BREAKOUT_EXIT"
 
@@ -1799,6 +1877,7 @@ class LevelService internal constructor(
                             ),
                             sizing = sizing,
                             tickSize = filters.tickSize,
+                            lotSize = filters.lotSize,
                             leverage = leverage,
                             projectedIsolatedMargin = plannedNotional.divide(
                                 leverage.toBigDecimal(),
@@ -2383,6 +2462,7 @@ private data class StoredLevel(
     var snapshot: LevelSnapshot,
     val signalTracker: LevelSignalTracker,
     val tickSize: BigDecimal,
+    val lotSize: BinanceLotSizeFilter,
     var npuMode: NpuMode = NpuMode.WARMING_UP,
     var preEntryPreparationInProgress: Boolean = false,
     var preparedOpportunity: PreEntryOpportunity? = null,
@@ -2440,6 +2520,7 @@ private data class LevelPlan(
     val key: LevelKey,
     val sizing: PlannedSizing,
     val tickSize: BigDecimal,
+    val lotSize: BinanceLotSizeFilter,
     val leverage: Int,
     val projectedIsolatedMargin: BigDecimal,
     val riskBoundaryStopPrice: BigDecimal,
@@ -2530,6 +2611,13 @@ private sealed interface SymbolLevelEvent {
         val requestId: String,
         val levelId: UUID,
         val confirmedPositionQuantity: BigDecimal,
+        val processedAt: Instant,
+        val publicMarketData: PublicMarketDataSnapshot?,
+    ) : SymbolLevelEvent
+
+    data class TakeProfitFilled(
+        val levelId: UUID,
+        val confirmedRemainingQuantity: BigDecimal,
         val processedAt: Instant,
         val publicMarketData: PublicMarketDataSnapshot?,
     ) : SymbolLevelEvent

@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
+import reactor.core.publisher.Sinks
 import reactor.core.scheduler.Schedulers
 import java.math.BigDecimal
 import java.time.Clock
@@ -74,9 +75,187 @@ class BreakoutExecutionServiceTest {
             }
             assertThat(harness.coordinator.crossingFills).containsExactly("cross")
             assertThat(harness.coordinator.finalFills).containsExactly("final")
+            val takeProfits = harness.executor.requests.filter { request ->
+                request.role == OrderRole.TAKE_PROFIT
+            }
+            assertThat(takeProfits.map(OrderIntentRequest::slot))
+                .containsExactly(1, 2, 3)
+            assertThat(takeProfits.map(OrderIntentRequest::type))
+                .containsOnly(OrderType.LIMIT)
+            assertThat(takeProfits.map(OrderIntentRequest::timeInForce))
+                .containsOnly(OrderTimeInForce.GTC)
+            assertThat(takeProfits).allSatisfy { takeProfit ->
+                assertThat(takeProfit.reduceOnly).isTrue()
+                assertThat(takeProfit.confirmedPositionAmount)
+                    .isEqualByComparingTo(
+                        if (direction == LevelDirection.LONG) "10" else "-10",
+                    )
+            }
+            assertThat(takeProfits.map { request -> checkNotNull(request.price) })
+                .usingElementComparator(BigDecimal::compareTo)
+                .containsExactlyElementsOf(
+                    if (direction == LevelDirection.LONG) {
+                        listOf(
+                            BigDecimal("100.7"),
+                            BigDecimal("101.4"),
+                            BigDecimal("102.0"),
+                        )
+                    } else {
+                        listOf(
+                            BigDecimal("99.3"),
+                            BigDecimal("98.6"),
+                            BigDecimal("98.0"),
+                        )
+                    },
+                )
+            assertThat(takeProfits.map { request ->
+                checkNotNull(request.confirmedQuantity)
+            })
+                .usingElementComparator(BigDecimal::compareTo)
+                .containsExactly(
+                    BigDecimal("3.300"),
+                    BigDecimal("3.300"),
+                    BigDecimal("3.400"),
+                )
             assertThat(harness.riskService.currentState().attempts.single()
                 .confirmedPositionQuantity).isEqualByComparingTo("10")
         }
+    }
+
+    @Test
+    fun `rounding residue is assigned to the third executable target`() {
+        val harness = harness(LevelDirection.LONG)
+        harness.riskService
+            .recordConfirmedExposure(LEVEL_ID, BigDecimal("6"))
+            .block(TIMEOUT)
+
+        val result = harness.service.execute(
+            addition(
+                direction = LevelDirection.LONG,
+                tranche = BreakoutTranche.FINAL,
+                requestedQuantity = "3.999",
+                confirmedQuantity = "6",
+            ),
+        ).block(TIMEOUT)!!
+
+        assertThat(result.status).isEqualTo(BreakoutResultStatus.CONFIRMED)
+        val quantities = harness.executor.requests
+            .filter { request -> request.role == OrderRole.TAKE_PROFIT }
+            .map { request -> checkNotNull(request.confirmedQuantity) }
+        assertThat(quantities)
+            .usingElementComparator(BigDecimal::compareTo)
+            .containsExactly(
+                BigDecimal("3.299"),
+                BigDecimal("3.299"),
+                BigDecimal("3.401"),
+            )
+        assertThat(quantities.fold(BigDecimal.ZERO, BigDecimal::add))
+            .isEqualByComparingTo("9.999")
+    }
+
+    @Test
+    fun `target prices use side-safe tick rounding for both directions`() {
+        listOf(LevelDirection.LONG, LevelDirection.SHORT).forEach { direction ->
+            val harness = harness(direction)
+            harness.riskService
+                .recordConfirmedExposure(LEVEL_ID, BigDecimal("6"))
+                .block(TIMEOUT)
+            val request = addition(
+                direction = direction,
+                tranche = BreakoutTranche.FINAL,
+                requestedQuantity = "4",
+                confirmedQuantity = "6",
+            ).copy(
+                levelPrice = BigDecimal("99.9"),
+                maxImpulsePct = BigDecimal.ONE,
+                tickSize = BigDecimal("0.3"),
+            )
+
+            harness.service.execute(request).block(TIMEOUT)
+
+            val prices = harness.executor.requests
+                .filter { candidate ->
+                    candidate.role == OrderRole.TAKE_PROFIT
+                }
+                .map { candidate -> checkNotNull(candidate.price) }
+            assertThat(prices)
+                .usingElementComparator(BigDecimal::compareTo)
+                .containsExactlyElementsOf(
+                    if (direction == LevelDirection.LONG) {
+                        listOf(
+                            BigDecimal("100.2"),
+                            BigDecimal("100.5"),
+                            BigDecimal("100.8"),
+                        )
+                    } else {
+                        listOf(
+                            BigDecimal("99.6"),
+                            BigDecimal("99.3"),
+                            BigDecimal("99.0"),
+                        )
+                    },
+                )
+        }
+    }
+
+    @Test
+    fun `incomplete target set is canceled closed and enters safe mode`() {
+        val harness = harness(LevelDirection.LONG)
+        harness.riskService
+            .recordConfirmedExposure(LEVEL_ID, BigDecimal("6"))
+            .block(TIMEOUT)
+        harness.executor.takeProfitConfirmed = false
+
+        val result = harness.service.execute(
+            addition(LevelDirection.LONG, BreakoutTranche.FINAL, "4", "6"),
+        ).block(TIMEOUT)!!
+
+        assertThat(result.terminalReason)
+            .isEqualTo(LevelReasonCode.TP_SETUP_FAILED)
+        assertThat(harness.coordinator.finalFills).isEmpty()
+        assertThat(harness.executor.cancelledTakeProfits).hasSize(3)
+        assertThat(harness.executor.requests.map(OrderIntentRequest::role))
+            .containsExactly(
+                OrderRole.ADDITION,
+                OrderRole.TAKE_PROFIT,
+                OrderRole.TAKE_PROFIT,
+                OrderRole.TAKE_PROFIT,
+                OrderRole.CLOSE,
+            )
+        assertThat(harness.riskService.currentState().globalTradingState)
+            .isEqualTo(com.scalpsecta.breakoutbot.level.GlobalTradingState.SAFE_MODE)
+        assertThat(harness.riskService.currentState().stateReason)
+            .isEqualTo(LevelReasonCode.TP_SETUP_FAILED.name)
+        assertThat(harness.riskService.currentState().reservations).isEmpty()
+        assertThat(harness.coordinator.terminations.last().unresolved).isFalse()
+    }
+
+    @Test
+    fun `confirmed take-profit fills reduce risk and all fills complete the attempt`() {
+        val harness = harness(LevelDirection.LONG)
+        harness.riskService
+            .recordConfirmedExposure(LEVEL_ID, BigDecimal("6"))
+            .block(TIMEOUT)
+        harness.service.execute(
+            addition(LevelDirection.LONG, BreakoutTranche.FINAL, "4", "6"),
+        ).block(TIMEOUT)
+
+        harness.executor.emitTakeProfitFill("6.7", complete = false)
+        harness.coordinator.takeProfitFillSignal.asFlux().next().block(TIMEOUT)
+
+        val partialState = harness.riskService.currentState()
+        assertThat(partialState.attempts.single().confirmedPositionQuantity)
+            .isEqualByComparingTo("6.7")
+        assertThat(partialState.reservedRiskForOpenPositions)
+            .isLessThan(BigDecimal("10"))
+
+        harness.executor.emitTakeProfitFill("0", complete = true)
+        harness.coordinator.takeProfitFillSignal.asFlux().skip(1).next().block(TIMEOUT)
+
+        assertThat(harness.coordinator.takeProfitFills)
+            .usingElementComparator(BigDecimal::compareTo)
+            .containsExactly(BigDecimal("6.7"), BigDecimal.ZERO)
+        assertThat(harness.riskService.currentState().reservations).isEmpty()
     }
 
     @Test
@@ -253,6 +432,12 @@ class BreakoutExecutionServiceTest {
             frozenNpu = BigDecimal("0.1"),
             hardStopClientOrderId = "hard-stop-1",
             hardStopPrice = BigDecimal(if (direction == LevelDirection.LONG) "99" else "101"),
+            levelPrice = BigDecimal("100"),
+            maxImpulsePct = BigDecimal("2"),
+            tickSize = BigDecimal("0.1"),
+            quantityStepSize = BigDecimal("0.001"),
+            minimumQuantity = BigDecimal("0.001"),
+            maximumQuantity = BigDecimal("1000"),
         )
 }
 
@@ -266,6 +451,8 @@ private data class BreakoutHarness(
 private class FakeBreakoutLevelCoordinator : BreakoutLevelCoordinator {
     val crossingFills = mutableListOf<String>()
     val finalFills = mutableListOf<String>()
+    val takeProfitFills = mutableListOf<BigDecimal>()
+    val takeProfitFillSignal = Sinks.many().replay().limit<BigDecimal>(10)
     val terminations = mutableListOf<BreakoutTermination>()
     var dispatchAllowed = true
 
@@ -303,6 +490,15 @@ private class FakeBreakoutLevelCoordinator : BreakoutLevelCoordinator {
     ): Mono<Void> =
         Mono.fromRunnable<Void> { finalFills += requestId }.then()
 
+    override fun recordTakeProfitFill(
+        levelId: UUID,
+        confirmedRemainingQuantity: BigDecimal,
+    ): Mono<Void> =
+        Mono.fromRunnable<Void> {
+            takeProfitFills += confirmedRemainingQuantity
+            takeProfitFillSignal.tryEmitNext(confirmedRemainingQuantity)
+        }.then()
+
     override fun terminate(
         levelId: UUID,
         reason: LevelReasonCode,
@@ -324,11 +520,18 @@ private data class BreakoutTermination(
     val unresolved: Boolean,
 )
 
-private class FakeBreakoutOrderExecutor : PreEntryOrderExecutor {
+private class FakeBreakoutOrderExecutor : BreakoutOrderExecutor {
     val requests = mutableListOf<OrderIntentRequest>()
+    val cancelledTakeProfits = mutableListOf<OrderIntent>()
     private val factory = ClientOrderIdFactory(STARTED_AT)
+    private val takeProfitFillSink = Sinks
+        .many()
+        .multicast()
+        .onBackpressureBuffer<TakeProfitFill>()
     var additionFilledQuantity: BigDecimal? = null
     var additionOutcome: OrderOutcome? = null
+    var takeProfitConfirmed: Boolean = true
+    private var reconciledPositionAmount: BigDecimal? = null
 
     override fun execute(request: OrderIntentRequest): Mono<OrderResolution> =
         Mono.fromCallable {
@@ -358,7 +561,10 @@ private class FakeBreakoutOrderExecutor : PreEntryOrderExecutor {
                             checkNotNull(request.confirmedPositionAmount)
                                 .add(signedFill),
                         reconciliationChecks = 0,
-                    )
+                    ).also { resolution ->
+                        reconciledPositionAmount =
+                            resolution.confirmedPositionAmount
+                    }
                 }
 
                 OrderRole.CLOSE -> OrderResolution(
@@ -377,10 +583,55 @@ private class FakeBreakoutOrderExecutor : PreEntryOrderExecutor {
             }
         }
 
-    override fun confirmHardStop(
-        request: OrderIntentRequest,
-    ): Mono<HardStopConfirmation> =
-        Mono.error(UnsupportedOperationException("Not used by breakout tests"))
+    override fun reconcilePosition(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<BigDecimal> = Mono.just(checkNotNull(reconciledPositionAmount))
+
+    override fun confirmTakeProfits(
+        requests: List<OrderIntentRequest>,
+        timeout: Duration,
+    ): Mono<TakeProfitSetConfirmation> = Mono.fromCallable {
+        this.requests += requests
+        val intents = requests.map(factory::create)
+        TakeProfitSetConfirmation(
+            intents = intents,
+            confirmed = takeProfitConfirmed,
+            confirmedPositionAmount = checkNotNull(
+                requests.first().confirmedPositionAmount,
+            ),
+            reconciliationChecks = 1,
+        )
+    }
+
+    override fun cancelTakeProfits(
+        intents: List<OrderIntent>,
+    ): Mono<Boolean> = Mono.fromCallable {
+        cancelledTakeProfits += intents
+        true
+    }
+
+    override fun activateTakeProfits(
+        confirmation: TakeProfitSetConfirmation,
+    ): Mono<Void> = Mono.empty()
+
+    override fun takeProfitFills(): Flux<TakeProfitFill> =
+        takeProfitFillSink.asFlux()
+
+    fun emitTakeProfitFill(
+        remainingQuantity: String,
+        complete: Boolean,
+    ) {
+        takeProfitFillSink.tryEmitNext(
+            TakeProfitFill(
+                levelId = LEVEL_ID,
+                symbol = "BTCUSDT",
+                clientOrderId = "take-profit-fill",
+                confirmedRemainingQuantity = BigDecimal(remainingQuantity),
+                allTakeProfitsFilled = complete,
+            ),
+        )
+    }
 }
 
 private val STARTED_AT: Instant = Instant.parse("2026-08-01T07:00:00Z")

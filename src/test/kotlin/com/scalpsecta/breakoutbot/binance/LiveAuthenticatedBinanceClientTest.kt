@@ -333,6 +333,29 @@ class LiveAuthenticatedBinanceClientTest {
     }
 
     @Test
+    fun `execution client cancels by deterministic client order ID`() {
+        val exchange = RecordingExchange { response(body = "{}") }
+        val client = client(exchange) as BinanceExecutionClient
+
+        client.cancelOrder(
+            symbol = "btcusdt",
+            clientOrderId = "take-profit-client-id",
+        ).block()
+
+        val request = exchange.requests.single()
+        assertThat(request.method()).isEqualTo(HttpMethod.DELETE)
+        assertThat(request.url().path).isEqualTo("/fapi/v1/order")
+        val query = UriComponentsBuilder
+            .fromUri(request.url())
+            .build()
+            .queryParams
+        assertThat(query.getFirst("symbol")).isEqualTo("BTCUSDT")
+        assertThat(query.getFirst("origClientOrderId"))
+            .isEqualTo("take-profit-client-id")
+        assertThat(query.getFirst("signature")).isNotBlank()
+    }
+
+    @Test
     fun `Binance errors do not expose credentials signatures or response bodies`() {
         val exchange = RecordingExchange {
             response(

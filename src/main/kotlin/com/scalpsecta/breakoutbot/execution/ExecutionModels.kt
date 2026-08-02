@@ -113,6 +113,7 @@ data class OrderResolution(
 enum class ExecutionReasonCode {
     ORDER_OUTCOME_UNKNOWN,
     STOP_SETUP_FAILED,
+    TP_SETUP_FAILED,
 }
 
 data class HardStopConfirmation(

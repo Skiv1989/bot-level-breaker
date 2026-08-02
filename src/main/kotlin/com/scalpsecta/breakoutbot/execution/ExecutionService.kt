@@ -48,7 +48,7 @@ class ExecutionService internal constructor(
     private val requestTimeout: Duration,
     private val reconciliationInterval: Duration,
     private val stopConfirmationTimeout: Duration = Duration.ofSeconds(2),
-) : PreEntryOrderExecutor {
+) : PreEntryOrderExecutor, BreakoutOrderExecutor {
     @Autowired
     constructor(
         client: BinanceExecutionClient,
@@ -83,6 +83,12 @@ class ExecutionService internal constructor(
     private val positions = ConcurrentHashMap<String, ExecutionPositionSnapshot>()
     private val balances = ConcurrentHashMap<String, ExecutionBalanceSnapshot>()
     private val activeSymbols = ConcurrentHashMap.newKeySet<String>()
+    private val activeTakeProfitSets =
+        ConcurrentHashMap<UUID, ActiveTakeProfitSet>()
+    private val takeProfitFillSink = Sinks
+        .many()
+        .multicast()
+        .onBackpressureBuffer<TakeProfitFill>()
     private val subscriptions = Disposables.composite()
 
     init {
@@ -156,6 +162,150 @@ class ExecutionService internal constructor(
         }.cache()
     }
 
+    override fun reconcilePosition(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<BigDecimal> = client
+        .reconcileOrder(symbol, clientOrderId)
+        .timeout(requestTimeout, scheduler)
+        .flatMap { reconciliation ->
+            val position = reconciliation.position
+                ?: return@flatMap Mono.error(
+                    OrderExecutionException(
+                        "Binance position reconciliation returned no position",
+                    ),
+                )
+            positions[position.symbol] = ExecutionPositionSnapshot(
+                symbol = position.symbol,
+                positionAmount = position.positionAmount,
+                entryPrice = position.entryPrice,
+                updatedAt = clock.instant(),
+            )
+            Mono.just(position.positionAmount)
+        }
+
+    override fun confirmTakeProfits(
+        requests: List<OrderIntentRequest>,
+        timeout: Duration,
+    ): Mono<TakeProfitSetConfirmation> {
+        require(!timeout.isZero && !timeout.isNegative) {
+            "Take-profit confirmation timeout must be positive"
+        }
+        val intents = requests.map(clientOrderIdFactory::create)
+        validateTakeProfitIntents(intents)
+        return Mono.defer {
+            val positionAmount = checkNotNull(
+                intents.first().confirmedPositionAmount,
+            )
+            symbolCoordinator
+                .recordOwnership(
+                    levelId = intents.first().levelId,
+                    ownsActiveAttempt = true,
+                    ownsExposure = true,
+                    hasUnresolvedOrder = true,
+                )
+                .then(
+                    symbolCoordinator.submit(
+                        symbol = intents.first().symbol,
+                        eventId =
+                            "take-profit-intents:${intents.first().levelId}",
+                    ) {
+                        intents.forEach(::recordIntent)
+                        activeTakeProfitSets[intents.first().levelId] =
+                            ActiveTakeProfitSet(
+                                levelId = intents.first().levelId,
+                                symbol = intents.first().symbol,
+                                initialPositionAmount = positionAmount,
+                                clientOrderIds = intents.mapTo(
+                                    linkedSetOf(),
+                                    OrderIntent::clientOrderId,
+                                ),
+                            )
+                    },
+                )
+                .then(
+                    placeAndConfirmTakeProfits(
+                        intents = intents,
+                        positionAmount = positionAmount,
+                        timeout = timeout,
+                    ),
+                )
+                .flatMap(::finalizeTakeProfitConfirmation)
+        }.cache()
+    }
+
+    override fun cancelTakeProfits(
+        intents: List<OrderIntent>,
+    ): Mono<Boolean> {
+        if (intents.isEmpty()) {
+            return Mono.just(true)
+        }
+        return Flux
+            .fromIterable(intents)
+            .concatMap { intent ->
+                client
+                    .cancelOrder(intent.symbol, intent.clientOrderId)
+                    .timeout(requestTimeout, scheduler)
+                    .then(
+                        symbolCoordinator.submit(
+                            symbol = intent.symbol,
+                            eventId =
+                                "take-profit-canceled:${intent.clientOrderId}",
+                        ) {
+                            orders.computeIfPresent(
+                                intent.clientOrderId,
+                            ) { _, current ->
+                                current.copy(
+                                    outcome = OrderOutcome.CANCELED,
+                                    updatedAt = clock.instant(),
+                                    reason = null,
+                                )
+                            }
+                            Unit
+                        },
+                    )
+                    .thenReturn(true)
+                    .onErrorReturn(false)
+            }
+            .collectList()
+            .map { results -> results.all { result -> result } }
+            .doOnNext { complete ->
+                if (complete) {
+                    activeTakeProfitSets.remove(intents.first().levelId)
+                }
+            }
+    }
+
+    override fun activateTakeProfits(
+        confirmation: TakeProfitSetConfirmation,
+    ): Mono<Void> {
+        require(confirmation.confirmed) {
+            "Only a confirmed take-profit set can be activated"
+        }
+        val first = confirmation.intents.first()
+        return symbolCoordinator
+            .submit(
+                symbol = first.symbol,
+                eventId = "take-profits-active:${first.levelId}",
+            ) {
+                val activeSet = checkNotNull(
+                    activeTakeProfitSets[first.levelId],
+                ) {
+                    "Confirmed take-profit set is not registered"
+                }
+                activeSet.activated = true
+                publishTakeProfitFill(
+                    activeSet = activeSet,
+                    clientOrderId = first.clientOrderId,
+                    updatedAt = clock.instant(),
+                )
+            }
+            .then()
+    }
+
+    override fun takeProfitFills(): Flux<TakeProfitFill> =
+        takeProfitFillSink.asFlux()
+
     fun currentState(): ExecutionSnapshot =
         ExecutionSnapshot(
             observedAt = clock.instant(),
@@ -173,6 +323,8 @@ class ExecutionService internal constructor(
     @PreDestroy
     fun close() {
         subscriptions.dispose()
+        takeProfitFillSink.tryEmitComplete()
+        activeTakeProfitSets.clear()
         pendingOrders.values.forEach { pending ->
             pending.result.tryEmitError(
                 IllegalStateException("Execution service is shutting down"),
@@ -450,6 +602,298 @@ class ExecutionService internal constructor(
             .thenReturn(confirmation)
     }
 
+    private fun placeAndConfirmTakeProfits(
+        intents: List<OrderIntent>,
+        positionAmount: BigDecimal,
+        timeout: Duration,
+    ): Mono<TakeProfitSetConfirmation> {
+        val checks = AtomicInteger()
+        val lastObservation =
+            AtomicReference<TakeProfitSetConfirmation?>()
+        val placement = Flux
+            .fromIterable(intents)
+            .flatMap(
+                { intent ->
+                    client
+                        .placeOrder(intent.toBinanceRequest())
+                        .timeout(requestTimeout, scheduler)
+                        .onErrorResume { Mono.empty() }
+                },
+                TAKE_PROFIT_COUNT,
+            )
+            .then()
+        return placement
+            .then(
+                reconcileTakeProfits(
+                    intents = intents,
+                    positionAmount = positionAmount,
+                    timeout = timeout,
+                    checks = checks,
+                    lastObservation = lastObservation,
+                ),
+            )
+            .timeout(timeout, scheduler)
+            .onErrorResume {
+                Mono.just(
+                    lastObservation.get()?.copy(confirmed = false)
+                        ?: TakeProfitSetConfirmation(
+                            intents = intents,
+                            confirmed = false,
+                            confirmedPositionAmount = positionAmount,
+                            reconciliationChecks = checks.get(),
+                        ),
+                )
+            }
+    }
+
+    private fun reconcileTakeProfits(
+        intents: List<OrderIntent>,
+        positionAmount: BigDecimal,
+        timeout: Duration,
+        checks: AtomicInteger,
+        lastObservation: AtomicReference<TakeProfitSetConfirmation?>,
+    ): Mono<TakeProfitSetConfirmation> {
+        val interval = minOf(
+            reconciliationInterval,
+            MAX_TAKE_PROFIT_CHECK_INTERVAL,
+        )
+        val maximumChecks = (
+            timeout.toMillis() /
+                interval.toMillis().coerceAtLeast(1L) +
+                1L
+            ).coerceAtMost(
+            MAX_TAKE_PROFIT_RECONCILIATION_CHECKS.toLong(),
+        ).toInt()
+        return Flux
+            .range(1, maximumChecks)
+            .concatMap { attempt ->
+                val delay = if (attempt == 1) Duration.ZERO else interval
+                Mono
+                    .delay(delay, scheduler)
+                    .thenMany(Flux.fromIterable(intents))
+                    .concatMap { intent ->
+                        client
+                            .reconcileOrder(
+                                symbol = intent.symbol,
+                                clientOrderId = intent.clientOrderId,
+                            )
+                            .onErrorResume { error ->
+                                Mono.just(
+                                    BinanceOrderReconciliation(
+                                        order = null,
+                                        position = null,
+                                        openClientOrderIds = emptySet(),
+                                        safeDetail =
+                                            error.javaClass.simpleName,
+                                    ),
+                                )
+                            }
+                    }
+                    .collectList()
+                    .flatMap { reconciliations ->
+                        checks.set(attempt)
+                        val evaluation = evaluateTakeProfits(
+                            intents = intents,
+                            attempt = attempt,
+                            reconciliations = reconciliations,
+                            fallbackPositionAmount = positionAmount,
+                        )
+                        lastObservation.set(evaluation.confirmation)
+                        symbolCoordinator
+                            .submit(
+                                symbol = intents.first().symbol,
+                                eventId =
+                                    "take-profit-reconciliation:${intents.first().levelId}:$attempt",
+                            ) {
+                                recordTakeProfitReconciliation(
+                                    intents = intents,
+                                    attempt = attempt,
+                                    reconciliations = reconciliations,
+                                    evaluation = evaluation,
+                                )
+                            }
+                            .thenReturn(evaluation)
+                    }
+            }
+            .filter(TakeProfitEvaluation::terminal)
+            .next()
+            .map(TakeProfitEvaluation::confirmation)
+            .switchIfEmpty(Mono.never())
+    }
+
+    private fun evaluateTakeProfits(
+        intents: List<OrderIntent>,
+        attempt: Int,
+        reconciliations: List<BinanceOrderReconciliation>,
+        fallbackPositionAmount: BigDecimal,
+    ): TakeProfitEvaluation {
+        val observedPositionAmount = reconciliations
+            .asReversed()
+            .firstNotNullOfOrNull { reconciliation ->
+                reconciliation.position?.positionAmount
+            }
+        val confirmed = reconciliations.all { reconciliation ->
+            reconciliation.position?.positionAmount?.compareTo(
+                fallbackPositionAmount,
+            ) == 0
+        } &&
+            intents.size == TAKE_PROFIT_COUNT &&
+            reconciliations.size == intents.size &&
+            intents.zip(reconciliations).all { (intent, reconciliation) ->
+                takeProfitMatches(intent, reconciliation)
+            }
+        val definitivelyFailed = reconciliations.any { reconciliation ->
+            reconciliation.order?.status?.uppercase() in
+                TAKE_PROFIT_TERMINAL_STATUSES
+        }
+        val positionAmount = observedPositionAmount ?: fallbackPositionAmount
+        return TakeProfitEvaluation(
+            terminal = confirmed || definitivelyFailed,
+            confirmation = TakeProfitSetConfirmation(
+                intents = intents,
+                confirmed = confirmed,
+                confirmedPositionAmount = positionAmount,
+                reconciliationChecks = attempt,
+            ),
+        )
+    }
+
+    private fun takeProfitMatches(
+        intent: OrderIntent,
+        reconciliation: BinanceOrderReconciliation,
+    ): Boolean {
+        val order = reconciliation.order ?: return false
+        return order.status.equals("NEW", ignoreCase = true) &&
+            order.clientOrderId == intent.clientOrderId &&
+            order.clientOrderId in reconciliation.openClientOrderIds &&
+            order.type.equals(OrderType.LIMIT.name, ignoreCase = true) &&
+            order.side.equals(intent.side.name, ignoreCase = true) &&
+            order.timeInForce.equals(
+                OrderTimeInForce.GTC.name,
+                ignoreCase = true,
+            ) &&
+            order.originalQuantity.compareTo(
+                checkNotNull(intent.confirmedQuantity),
+            ) == 0 &&
+            order.price?.compareTo(checkNotNull(intent.price)) == 0 &&
+            order.reduceOnly &&
+            !order.closePosition
+    }
+
+    private fun recordTakeProfitReconciliation(
+        intents: List<OrderIntent>,
+        attempt: Int,
+        reconciliations: List<BinanceOrderReconciliation>,
+        evaluation: TakeProfitEvaluation,
+    ) {
+        reconciliations.firstNotNullOfOrNull { reconciliation ->
+            reconciliation.position
+        }?.let { position ->
+            positions[position.symbol] = ExecutionPositionSnapshot(
+                symbol = position.symbol,
+                positionAmount = position.positionAmount,
+                entryPrice = position.entryPrice,
+                updatedAt = clock.instant(),
+            )
+        }
+        intents.zip(reconciliations).forEach { (intent, reconciliation) ->
+            val result = when {
+                evaluation.confirmation.confirmed -> OrderOutcome.ACTIVE.name
+                evaluation.terminal ->
+                    ExecutionReasonCode.TP_SETUP_FAILED.name
+
+                else -> OrderOutcome.UNKNOWN.name
+            }
+            evidenceRecorder.recordReconciliation(
+                levelId = intent.levelId,
+                symbol = intent.symbol,
+                timestamp = clock.instant(),
+                reconciliation = ReconciliationEvidence(
+                    clientOrderId = intent.clientOrderId,
+                    attemptNumber = attempt,
+                    result = result,
+                    exchangeOrderId = reconciliation.order?.orderId,
+                    requestedQuantity = intent.confirmedQuantity,
+                    filledQuantity =
+                        reconciliation.order?.executedQuantity,
+                    safeDetail = reconciliation.safeDetail,
+                ),
+            )
+        }
+    }
+
+    private fun finalizeTakeProfitConfirmation(
+        confirmation: TakeProfitSetConfirmation,
+    ): Mono<TakeProfitSetConfirmation> {
+        confirmation.intents.forEach { intent ->
+            orders.computeIfPresent(intent.clientOrderId) { _, current ->
+                current.copy(
+                    outcome = if (confirmation.confirmed) {
+                        OrderOutcome.ACTIVE
+                    } else {
+                        OrderOutcome.UNKNOWN
+                    },
+                    source = OrderResolutionSource.REST_RECONCILIATION,
+                    updatedAt = clock.instant(),
+                    reason = if (confirmation.confirmed) {
+                        null
+                    } else {
+                        ExecutionReasonCode.TP_SETUP_FAILED
+                    },
+                )
+            }
+        }
+        val first = confirmation.intents.first()
+        if (!confirmation.confirmed) {
+            activeTakeProfitSets.remove(first.levelId)
+        }
+        val exposure = confirmation.confirmedPositionAmount.signum() != 0
+        return symbolCoordinator
+            .recordOwnership(
+                levelId = first.levelId,
+                ownsActiveAttempt = true,
+                ownsExposure = exposure,
+                hasUnresolvedOrder = !confirmation.confirmed,
+            )
+            .thenReturn(confirmation)
+    }
+
+    private fun validateTakeProfitIntents(intents: List<OrderIntent>) {
+        require(intents.size == TAKE_PROFIT_COUNT) {
+            "Exactly three take-profit intents are required"
+        }
+        val first = intents.first()
+        require(intents.map(OrderIntent::levelId).toSet().size == 1) {
+            "Take-profit intents must belong to one level"
+        }
+        require(intents.map(OrderIntent::symbol).toSet().size == 1) {
+            "Take-profit intents must belong to one symbol"
+        }
+        require(intents.map(OrderIntent::slot).toSet() == setOf(1, 2, 3)) {
+            "Take-profit slots must be 1, 2, and 3"
+        }
+        require(intents.all { intent ->
+            intent.role == OrderRole.TAKE_PROFIT &&
+                intent.type == OrderType.LIMIT &&
+                intent.timeInForce == OrderTimeInForce.GTC &&
+                intent.reduceOnly &&
+                !intent.closePosition &&
+                intent.confirmedPositionAmount ==
+                first.confirmedPositionAmount
+        }) {
+            "Take profits must be reduce-only LIMIT GTC orders"
+        }
+        val totalQuantity = intents.fold(BigDecimal.ZERO) { total, intent ->
+            total.add(checkNotNull(intent.confirmedQuantity))
+        }
+        require(
+            totalQuantity <=
+                checkNotNull(first.confirmedPositionAmount).abs(),
+        ) {
+            "Take-profit quantities cannot exceed confirmed exposure"
+        }
+    }
+
     private fun resolvePlacedOrder(
         pending: PendingOrder,
     ): Mono<OrderResolution> {
@@ -633,7 +1077,11 @@ class ExecutionService internal constructor(
     }
 
     private fun handlePrivateOrder(event: BinanceUserDataEvent.OrderUpdate) {
-        val pending = pendingOrders[event.clientOrderId] ?: return
+        val pending = pendingOrders[event.clientOrderId]
+        if (pending == null) {
+            handleActiveTakeProfit(event)
+            return
+        }
         val outcome = classifiedOutcome(
             status = event.orderStatus,
             actualFilledQuantity = event.accumulatedFilledQuantity,
@@ -670,6 +1118,98 @@ class ExecutionService internal constructor(
                 reconciliationChecks = 0,
             ),
         )
+    }
+
+    private fun handleActiveTakeProfit(
+        event: BinanceUserDataEvent.OrderUpdate,
+    ) {
+        val current = orders[event.clientOrderId] ?: return
+        if (current.role != OrderRole.TAKE_PROFIT) {
+            return
+        }
+        val activeSet = activeTakeProfitSets[current.levelId] ?: return
+        if (event.clientOrderId !in activeSet.clientOrderIds) {
+            return
+        }
+        val accumulatedFill = maxOf(
+            current.actualFilledQuantity,
+            event.accumulatedFilledQuantity,
+        )
+        val outcome = when (event.orderStatus.uppercase()) {
+            "NEW" -> OrderOutcome.ACTIVE
+            else -> classifiedOutcome(
+                status = event.orderStatus,
+                actualFilledQuantity = accumulatedFill,
+            )
+        }
+        orders[event.clientOrderId] = current.copy(
+            actualFilledQuantity = accumulatedFill,
+            outcome = outcome ?: current.outcome,
+            source = OrderResolutionSource.PRIVATE_STREAM,
+            exchangeOrderId = event.orderId,
+            updatedAt = event.receivedAt,
+        )
+        if (accumulatedFill <= current.actualFilledQuantity) {
+            return
+        }
+        publishTakeProfitFill(
+            activeSet = activeSet,
+            clientOrderId = event.clientOrderId,
+            updatedAt = event.receivedAt,
+        )
+    }
+
+    private fun publishTakeProfitFill(
+        activeSet: ActiveTakeProfitSet,
+        clientOrderId: String,
+        updatedAt: java.time.Instant,
+    ) {
+        if (!activeSet.activated) {
+            return
+        }
+        val totalFilled = activeSet.clientOrderIds.fold(BigDecimal.ZERO) {
+                total, orderClientId,
+            ->
+            total.add(
+                orders[orderClientId]?.actualFilledQuantity
+                    ?: BigDecimal.ZERO,
+            )
+        }.min(activeSet.initialPositionAmount.abs())
+        val remainingQuantity = activeSet.initialPositionAmount
+            .abs()
+            .subtract(totalFilled)
+            .max(BigDecimal.ZERO)
+        if (remainingQuantity >= activeSet.lastReportedRemainingQuantity) {
+            return
+        }
+        activeSet.lastReportedRemainingQuantity = remainingQuantity
+        val remainingPositionAmount = if (
+            activeSet.initialPositionAmount.signum() > 0
+        ) {
+            remainingQuantity
+        } else {
+            remainingQuantity.negate()
+        }
+        positions[activeSet.symbol] = ExecutionPositionSnapshot(
+            symbol = activeSet.symbol,
+            positionAmount = remainingPositionAmount,
+            entryPrice =
+                positions[activeSet.symbol]?.entryPrice ?: BigDecimal.ZERO,
+            updatedAt = updatedAt,
+        )
+        val complete = remainingQuantity.signum() == 0
+        takeProfitFillSink.tryEmitNext(
+            TakeProfitFill(
+                levelId = activeSet.levelId,
+                symbol = activeSet.symbol,
+                clientOrderId = clientOrderId,
+                confirmedRemainingQuantity = remainingQuantity,
+                allTakeProfitsFilled = complete,
+            ),
+        )
+        if (complete) {
+            activeTakeProfitSets.remove(activeSet.levelId, activeSet)
+        }
     }
 
     private fun handleAccountUpdate(
@@ -977,10 +1517,36 @@ private data class HardStopEvaluation(
     val confirmation: HardStopConfirmation,
 )
 
+private data class TakeProfitEvaluation(
+    val terminal: Boolean,
+    val confirmation: TakeProfitSetConfirmation,
+)
+
+private data class ActiveTakeProfitSet(
+    val levelId: UUID,
+    val symbol: String,
+    val initialPositionAmount: BigDecimal,
+    val clientOrderIds: Set<String>,
+    var activated: Boolean = false,
+    var lastReportedRemainingQuantity: BigDecimal =
+        initialPositionAmount.abs(),
+)
+
 private const val MAX_RECONCILIATION_CHECKS = 3
 private const val MAX_STOP_RECONCILIATION_CHECKS = 50
+private const val MAX_TAKE_PROFIT_RECONCILIATION_CHECKS = 75
+private const val TAKE_PROFIT_COUNT = 3
 private val MAX_STOP_CHECK_INTERVAL: Duration = Duration.ofMillis(250)
+private val MAX_TAKE_PROFIT_CHECK_INTERVAL: Duration = Duration.ofMillis(250)
 private val STOP_TERMINAL_STATUSES = setOf(
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "EXPIRED_IN_MATCH",
+    "FILLED",
+    "REJECTED",
+)
+private val TAKE_PROFIT_TERMINAL_STATUSES = setOf(
     "CANCELED",
     "CANCELLED",
     "EXPIRED",

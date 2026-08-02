@@ -127,6 +127,8 @@ enum class LevelReasonCode {
     MARKET_DATA_FAILURE,
     PRIVATE_STREAM_FAILURE,
     ORDER_OUTCOME_UNKNOWN,
+    TP_SETUP_FAILED,
+    TAKE_PROFITS_COMPLETE,
 }
 
 class LevelException(

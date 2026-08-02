@@ -343,6 +343,24 @@ class LiveAuthenticatedBinanceClient(
         }
     }
 
+    override fun cancelOrder(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<Void> {
+        val normalizedSymbol = normalizedSymbol(symbol)
+        require(clientOrderId.matches(BINANCE_CLIENT_ORDER_ID)) {
+            "clientOrderId must be Binance-safe"
+        }
+        return signedRequest(
+            method = HttpMethod.DELETE,
+            path = ORDER_PATH,
+            parameters = linkedMapOf(
+                "symbol" to normalizedSymbol,
+                "origClientOrderId" to clientOrderId,
+            ),
+        ).then()
+    }
+
     override fun reconcileOrder(
         symbol: String,
         clientOrderId: String,
@@ -530,6 +548,9 @@ class LiveAuthenticatedBinanceClient(
             closePosition = payload.requiredBoolean("closePosition"),
             updatedAt = Instant.ofEpochMilli(payload.requiredLong("updateTime")),
             type = payload.optionalText("type"),
+            side = payload.optionalText("side"),
+            timeInForce = payload.optionalText("timeInForce"),
+            price = payload.optionalDecimal("price"),
             stopPrice = payload.optionalDecimal("stopPrice"),
             workingType = payload.optionalText("workingType"),
             priceProtect = payload.optionalBoolean("priceProtect"),

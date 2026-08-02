@@ -5,6 +5,7 @@ import com.scalpsecta.breakoutbot.level.LevelReasonCode
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import java.math.BigDecimal
+import java.time.Duration
 import java.util.UUID
 
 sealed interface BreakoutExecutionRequest {
@@ -29,6 +30,12 @@ data class BreakoutAdditionRequest(
     val frozenNpu: BigDecimal,
     val hardStopClientOrderId: String,
     val hardStopPrice: BigDecimal,
+    val levelPrice: BigDecimal,
+    val maxImpulsePct: BigDecimal,
+    val tickSize: BigDecimal,
+    val quantityStepSize: BigDecimal,
+    val minimumQuantity: BigDecimal,
+    val maximumQuantity: BigDecimal,
 ) : BreakoutExecutionRequest
 
 data class BreakoutExitRequest(
@@ -75,6 +82,43 @@ data class BreakoutResult(
     val confirmedPositionQuantity: BigDecimal = BigDecimal.ZERO,
 )
 
+data class TakeProfitSetConfirmation(
+    val intents: List<OrderIntent>,
+    val confirmed: Boolean,
+    val confirmedPositionAmount: BigDecimal,
+    val reconciliationChecks: Int,
+)
+
+data class TakeProfitFill(
+    val levelId: UUID,
+    val symbol: String,
+    val clientOrderId: String,
+    val confirmedRemainingQuantity: BigDecimal,
+    val allTakeProfitsFilled: Boolean,
+)
+
+interface BreakoutOrderExecutor {
+    fun execute(request: OrderIntentRequest): Mono<OrderResolution>
+
+    fun reconcilePosition(
+        symbol: String,
+        clientOrderId: String,
+    ): Mono<BigDecimal>
+
+    fun confirmTakeProfits(
+        requests: List<OrderIntentRequest>,
+        timeout: Duration,
+    ): Mono<TakeProfitSetConfirmation>
+
+    fun activateTakeProfits(
+        confirmation: TakeProfitSetConfirmation,
+    ): Mono<Void>
+
+    fun cancelTakeProfits(intents: List<OrderIntent>): Mono<Boolean>
+
+    fun takeProfitFills(): Flux<TakeProfitFill>
+}
+
 interface BreakoutLevelCoordinator {
     fun breakoutRequests(): Flux<BreakoutExecutionRequest>
 
@@ -92,6 +136,11 @@ interface BreakoutLevelCoordinator {
         requestId: String,
         levelId: UUID,
         confirmedPositionQuantity: BigDecimal,
+    ): Mono<Void>
+
+    fun recordTakeProfitFill(
+        levelId: UUID,
+        confirmedRemainingQuantity: BigDecimal,
     ): Mono<Void>
 
     fun terminate(
