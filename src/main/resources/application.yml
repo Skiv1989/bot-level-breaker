@@ -28,6 +28,8 @@ bot:
     stop-confirmation-timeout: 2s
     take-profit-setup-timeout: 3s
     normal-exit-wait: 500ms
+  risk:
+    monitor-interval: 1s
   failure:
     monitor-interval: 50ms
     reconciliation-interval: 1s

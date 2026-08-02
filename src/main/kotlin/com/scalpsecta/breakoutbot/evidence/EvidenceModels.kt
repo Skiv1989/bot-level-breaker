@@ -112,6 +112,12 @@ data class RiskEvidence(
     val reservedRisk: BigDecimal? = null,
     val releasedRisk: BigDecimal? = null,
     val remainingReservedRisk: BigDecimal? = null,
+    val dailyAnchorKind: String? = null,
+    val dailyAnchorEquity: BigDecimal? = null,
+    val currentTotalAccountEquity: BigDecimal? = null,
+    val tradingDrawdown: BigDecimal? = null,
+    val consecutiveLossCount: Int? = null,
+    val entryCooldownUntil: Instant? = null,
 )
 
 data class PnlEvidence(

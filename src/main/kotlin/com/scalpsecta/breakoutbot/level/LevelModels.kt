@@ -157,6 +157,7 @@ enum class LevelReasonCode {
     MAX_HOLD_TIME,
     HARD_STOP_FILLED,
     TAKE_PROFITS_COMPLETE,
+    DAILY_LOSS_LIMIT,
 }
 
 class LevelException(

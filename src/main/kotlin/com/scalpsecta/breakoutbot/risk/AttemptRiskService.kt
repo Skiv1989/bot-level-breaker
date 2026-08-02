@@ -23,6 +23,8 @@ import java.math.RoundingMode
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
@@ -46,8 +48,14 @@ class AttemptRiskService internal constructor(
     private val attempts = linkedMapOf<UUID, MutableRiskAttempt>()
     private val reservations = linkedMapOf<UUID, MutableRiskReservation>()
     private var latestAccountState: RiskAccountState? = null
-    private var globalTradingState = GlobalTradingState.RUNNING
-    private var stateReason: String? = null
+    private var dailyAnchorKind: DailyAnchorKind? = null
+    private var dailyAnchorEstablishedAt: Instant? = null
+    private var nextDailyBoundary: Instant? = null
+    private var dailyLockedAt: Instant? = null
+    private var safeModeReason: String? = null
+    private var manualLockReason: String? = null
+    private var consecutiveLossCount = 0
+    private var entryCooldownUntil: Instant? = null
     private val safeModeEvents = ArrayDeque<Instant>()
     private var nextSequence = 1L
     private val publishedState = AtomicReference(emptySnapshot(clock.instant()))
@@ -60,6 +68,30 @@ class AttemptRiskService internal constructor(
         queue
             .submit(RiskEvent.Admit(request, accountState, clock.instant()))
             .map { result -> result as AttemptAdmissionDecision }
+
+    fun observeDailyAccount(
+        observation: DailyRiskAccountObservation,
+    ): Mono<DailyRiskEvaluation> =
+        queue
+            .submit(
+                RiskEvent.ObserveDailyAccount(
+                    observation = observation,
+                    observedAt = clock.instant(),
+                ),
+            )
+            .map { result -> result as DailyRiskEvaluation }
+
+    fun recordDailyTransfer(
+        transfer: DailyRiskTransfer,
+    ): Mono<GlobalRiskSnapshot> =
+        queue
+            .submit(
+                RiskEvent.RecordDailyTransfer(
+                    transfer = transfer,
+                    recordedAt = clock.instant(),
+                ),
+            )
+            .map { result -> result as GlobalRiskSnapshot }
 
     fun recordConfirmedExposure(
         levelId: UUID,
@@ -87,9 +119,18 @@ class AttemptRiskService internal constructor(
             )
             .map { result -> result as GlobalRiskSnapshot }
 
-    fun recordConfirmedFlat(levelId: UUID): Mono<GlobalRiskSnapshot> =
+    fun recordConfirmedFlat(
+        levelId: UUID,
+        netPnl: BigDecimal? = null,
+    ): Mono<GlobalRiskSnapshot> =
         queue
-            .submit(RiskEvent.ConfirmedFlat(levelId, clock.instant()))
+            .submit(
+                RiskEvent.ConfirmedFlat(
+                    levelId = levelId,
+                    confirmedAt = clock.instant(),
+                    netPnl = netPnl,
+                ),
+            )
             .map { result -> result as GlobalRiskSnapshot }
 
     fun enterSafeMode(reason: String): Mono<GlobalRiskSnapshot> {
@@ -111,7 +152,26 @@ class AttemptRiskService internal constructor(
             .map { result -> result as GlobalRiskSnapshot }
     }
 
-    fun currentState(): GlobalRiskSnapshot = publishedState.get()
+    fun currentState(): GlobalRiskSnapshot {
+        val now = clock.instant()
+        val current = publishedState.get()
+        val cooldownExpired =
+            current.globalTradingState == GlobalTradingState.ENTRY_COOLDOWN &&
+                current.entryCooldownUntil?.let { deadline ->
+                    !now.isBefore(deadline)
+                } == true
+        return if (!cooldownExpired) {
+            current
+        } else {
+            current.copy(
+                observedAt = now,
+                globalTradingState = GlobalTradingState.RUNNING,
+                stateReason = null,
+                consecutiveLossCount = 0,
+                entryCooldownUntil = null,
+            )
+        }
+    }
 
     @PreDestroy
     fun close() {
@@ -122,6 +182,8 @@ class AttemptRiskService internal constructor(
     private fun handle(event: RiskEvent): Any =
         when (event) {
             is RiskEvent.Admit -> admit(event)
+            is RiskEvent.ObserveDailyAccount -> observeDailyAccount(event)
+            is RiskEvent.RecordDailyTransfer -> recordDailyTransfer(event)
             is RiskEvent.ConfirmedExposure -> confirmExposure(event)
             is RiskEvent.ConfirmedReducingFill -> confirmReducingFill(event)
             is RiskEvent.ConfirmedFlat -> confirmFlat(event)
@@ -135,16 +197,15 @@ class AttemptRiskService internal constructor(
     ): GlobalRiskSnapshot {
         pruneSafeModeEvents(event.enteredAt)
         if (
-            globalTradingState != GlobalTradingState.SAFE_MODE &&
-            globalTradingState != GlobalTradingState.MANUAL_LOCK
+            safeModeReason == null &&
+            manualLockReason == null
         ) {
             safeModeEvents.addLast(event.enteredAt)
             if (safeModeEvents.size >= SAFE_MODE_ESCALATION_COUNT) {
-                globalTradingState = GlobalTradingState.MANUAL_LOCK
-                stateReason = SAFE_MODE_ESCALATION_REASON
+                manualLockReason = SAFE_MODE_ESCALATION_REASON
+                safeModeReason = null
             } else {
-                globalTradingState = GlobalTradingState.SAFE_MODE
-                stateReason = event.reason
+                safeModeReason = event.reason
             }
         }
         return publishState()
@@ -154,10 +215,7 @@ class AttemptRiskService internal constructor(
         event: RiskEvent.RecoverFromSafeMode,
     ): GlobalRiskSnapshot {
         pruneSafeModeEvents(event.recoveredAt)
-        if (globalTradingState == GlobalTradingState.SAFE_MODE) {
-            globalTradingState = GlobalTradingState.RUNNING
-            stateReason = null
-        }
+        safeModeReason = null
         return publishState()
     }
 
@@ -165,8 +223,8 @@ class AttemptRiskService internal constructor(
         event: RiskEvent.EnterManualLock,
     ): GlobalRiskSnapshot {
         pruneSafeModeEvents(event.enteredAt)
-        globalTradingState = GlobalTradingState.MANUAL_LOCK
-        stateReason = event.reason
+        manualLockReason = event.reason
+        safeModeReason = null
         return publishState()
     }
 
@@ -177,11 +235,123 @@ class AttemptRiskService internal constructor(
         }
     }
 
+    private fun observeDailyAccount(
+        event: RiskEvent.ObserveDailyAccount,
+    ): DailyRiskEvaluation {
+        validate(event.observation)
+        advanceTemporalState(event.observedAt)
+        val startupAnchorEstablished = latestAccountState == null
+        if (startupAnchorEstablished) {
+            latestAccountState = RiskAccountState(
+                dailyAnchorEquity = event.observation.totalAccountEquity,
+                currentTotalAccountEquity = event.observation.totalAccountEquity,
+                availableMargin = event.observation.availableMargin,
+            )
+            dailyAnchorKind = DailyAnchorKind.TEMPORARY_RESTART
+            dailyAnchorEstablishedAt = event.observedAt
+            nextDailyBoundary = nextDailyBoundary(event.observedAt)
+            recordDailyRiskAudit(
+                decision = TEMPORARY_ANCHOR_DECISION,
+                timestamp = event.observedAt,
+            )
+        }
+
+        val rollover = !startupAnchorEstablished &&
+            nextDailyBoundary?.let { boundary ->
+                !event.observedAt.isBefore(boundary)
+            } == true
+        if (rollover) {
+            latestAccountState = RiskAccountState(
+                dailyAnchorEquity = event.observation.totalAccountEquity,
+                currentTotalAccountEquity = event.observation.totalAccountEquity,
+                availableMargin = event.observation.availableMargin,
+            )
+            dailyAnchorKind = DailyAnchorKind.SCHEDULED_03_00_UTC
+            dailyAnchorEstablishedAt = mostRecentDailyBoundary(event.observedAt)
+            nextDailyBoundary = nextDailyBoundary(event.observedAt)
+            if (event.observation.accountValid) {
+                dailyLockedAt = null
+            }
+            recordDailyRiskAudit(
+                decision = DAILY_ROLLOVER_DECISION,
+                timestamp = event.observedAt,
+            )
+        } else if (!startupAnchorEstablished) {
+            val current = checkNotNull(latestAccountState)
+            latestAccountState = current.copy(
+                currentTotalAccountEquity =
+                    event.observation.totalAccountEquity,
+                availableMargin = event.observation.availableMargin,
+            )
+        }
+
+        val breachTriggered = triggerDailyBreachIfNeeded(event.observedAt)
+        return DailyRiskEvaluation(
+            state = publishState(),
+            startupAnchorEstablished = startupAnchorEstablished,
+            dailyRollover = rollover,
+            dailyBreachTriggered = breachTriggered,
+        )
+    }
+
+    private fun recordDailyTransfer(
+        event: RiskEvent.RecordDailyTransfer,
+    ): GlobalRiskSnapshot {
+        require(event.transfer.deposits.signum() >= 0) {
+            "deposits must not be negative"
+        }
+        require(event.transfer.withdrawals.signum() >= 0) {
+            "withdrawals must not be negative"
+        }
+        advanceTemporalState(event.recordedAt)
+        val current = latestAccountState ?: return publishState()
+        latestAccountState = current.copy(
+            depositsSinceAnchor = current.depositsSinceAnchor
+                .add(event.transfer.deposits),
+            withdrawalsSinceAnchor = current.withdrawalsSinceAnchor
+                .add(event.transfer.withdrawals),
+        )
+        return publishState()
+    }
+
+    private fun triggerDailyBreachIfNeeded(now: Instant): Boolean {
+        val accountState = latestAccountState ?: return false
+        if (
+            dailyLockedAt != null ||
+            tradingDrawdown(accountState) < dailyLossLimit(accountState)
+        ) {
+            return false
+        }
+        dailyLockedAt = now
+        recordDailyRiskAudit(
+            decision = DAILY_BREACH_DECISION,
+            timestamp = now,
+        )
+        return true
+    }
+
+    private fun advanceTemporalState(now: Instant) {
+        val cooldownDeadline = entryCooldownUntil
+        if (
+            cooldownDeadline != null &&
+            !now.isBefore(cooldownDeadline)
+        ) {
+            entryCooldownUntil = null
+            consecutiveLossCount = 0
+        }
+    }
+
     private fun admit(event: RiskEvent.Admit): AttemptAdmissionDecision {
         validate(event.request, event.accountState)
-        latestAccountState = event.accountState
+        advanceTemporalState(event.admittedAt)
+        latestAccountState = accountStateForAdmission(
+            accountState = event.accountState,
+            admittedAt = event.admittedAt,
+        )
+        triggerDailyBreachIfNeeded(event.admittedAt)
+        val effectiveAccountState = checkNotNull(latestAccountState)
         val plan = plan(event.request)
-        val blockers = blockers(event.request, event.accountState, plan)
+        val blockers = blockers(event.request, effectiveAccountState, plan)
         if (blockers.isEmpty()) {
             val sequence = nextSequence++
             attempts[event.request.levelId] = MutableRiskAttempt(
@@ -192,6 +362,7 @@ class AttemptRiskService internal constructor(
                 admittedAt = event.admittedAt,
                 completedAt = null,
                 confirmedPositionQuantity = BigDecimal.ZERO,
+                netPnl = null,
                 plan = plan,
             )
             reservations[event.request.levelId] = MutableRiskReservation(
@@ -349,6 +520,30 @@ class AttemptRiskService internal constructor(
         attempt.status = RiskAttemptStatus.FLAT_CONFIRMED
         attempt.confirmedPositionQuantity = BigDecimal.ZERO
         attempt.completedAt = event.confirmedAt
+        event.netPnl?.let { netPnl ->
+            require(attempt.netPnl == null) {
+                "Net PnL is already recorded for level ${event.levelId}"
+            }
+            attempt.netPnl = netPnl
+            when (netPnl.signum()) {
+                -1 -> {
+                    consecutiveLossCount += 1
+                    if (
+                        consecutiveLossCount >= CONSECUTIVE_LOSS_LIMIT &&
+                        entryCooldownUntil == null
+                    ) {
+                        entryCooldownUntil =
+                            event.confirmedAt.plus(ENTRY_COOLDOWN_DURATION)
+                        recordDailyRiskAudit(
+                            decision = ENTRY_COOLDOWN_DECISION,
+                            timestamp = event.confirmedAt,
+                        )
+                    }
+                }
+
+                else -> consecutiveLossCount = 0
+            }
+        }
         return publishState().also {
             evidenceRecorder.recordAudit(
                 AuditRecordDraft(
@@ -386,8 +581,17 @@ class AttemptRiskService internal constructor(
         plan: AttemptRiskPlan,
     ): List<RiskBlockerCode> =
         buildList {
-            if (globalTradingState != GlobalTradingState.RUNNING) {
-                add(RiskBlockerCode.BLOCKED_SAFE_MODE)
+            when (effectiveGlobalTradingState(clock.instant())) {
+                GlobalTradingState.RUNNING -> Unit
+                GlobalTradingState.ENTRY_COOLDOWN ->
+                    add(RiskBlockerCode.BLOCKED_ENTRY_COOLDOWN)
+
+                GlobalTradingState.DAILY_LOCKED ->
+                    add(RiskBlockerCode.BLOCKED_DAILY_LOCK)
+
+                GlobalTradingState.SAFE_MODE,
+                GlobalTradingState.MANUAL_LOCK,
+                -> add(RiskBlockerCode.BLOCKED_SAFE_MODE)
             }
             if (plan.estimatedWorstNetLoss > plan.levelRiskBudget) {
                 add(RiskBlockerCode.STOP_RISK_TOO_HIGH)
@@ -703,6 +907,88 @@ class AttemptRiskService internal constructor(
         }
     }
 
+    private fun validate(observation: DailyRiskAccountObservation) {
+        require(observation.totalAccountEquity.signum() > 0) {
+            "totalAccountEquity must be positive"
+        }
+        require(observation.availableMargin.signum() >= 0) {
+            "availableMargin must not be negative"
+        }
+    }
+
+    private fun accountStateForAdmission(
+        accountState: RiskAccountState,
+        admittedAt: Instant,
+    ): RiskAccountState {
+        val current = latestAccountState
+        if (current == null) {
+            dailyAnchorKind = DailyAnchorKind.TEMPORARY_RESTART
+            dailyAnchorEstablishedAt = admittedAt
+            nextDailyBoundary = nextDailyBoundary(admittedAt)
+            recordDailyRiskAudit(
+                decision = TEMPORARY_ANCHOR_DECISION,
+                timestamp = admittedAt,
+                accountState = accountState,
+            )
+            return accountState
+        }
+        if (
+            nextDailyBoundary?.let { boundary ->
+                !admittedAt.isBefore(boundary)
+            } == true
+        ) {
+            dailyAnchorKind = DailyAnchorKind.SCHEDULED_03_00_UTC
+            dailyAnchorEstablishedAt = mostRecentDailyBoundary(admittedAt)
+            nextDailyBoundary = nextDailyBoundary(admittedAt)
+            dailyLockedAt = null
+            return RiskAccountState(
+                dailyAnchorEquity = accountState.currentTotalAccountEquity,
+                currentTotalAccountEquity =
+                    accountState.currentTotalAccountEquity,
+                availableMargin = accountState.availableMargin,
+            ).also {
+                recordDailyRiskAudit(
+                    decision = DAILY_ROLLOVER_DECISION,
+                    timestamp = admittedAt,
+                    accountState = it,
+                )
+            }
+        }
+        return current.copy(
+            currentTotalAccountEquity = accountState.currentTotalAccountEquity,
+            availableMargin = accountState.availableMargin,
+        )
+    }
+
+    private fun recordDailyRiskAudit(
+        decision: String,
+        timestamp: Instant,
+        accountState: RiskAccountState? = latestAccountState,
+    ) {
+        evidenceRecorder.recordAudit(
+            AuditRecordDraft(
+                timestamp = timestamp,
+                symbol = GLOBAL_RISK_AUDIT_SYMBOL,
+                levelId = GLOBAL_RISK_AUDIT_LEVEL_ID,
+                stateBefore = null,
+                stateAfter = null,
+                eventType = AuditEventType.RISK_UPDATED,
+                decision = decision,
+                evidence = DecisionEvidence(
+                    risk = RiskEvidence(
+                        dailyAnchorKind = dailyAnchorKind?.name,
+                        dailyAnchorEquity = accountState?.dailyAnchorEquity,
+                        currentTotalAccountEquity =
+                            accountState?.currentTotalAccountEquity,
+                        tradingDrawdown = accountState?.let(::tradingDrawdown),
+                        consecutiveLossCount = consecutiveLossCount,
+                        entryCooldownUntil = entryCooldownUntil,
+                    ),
+                ),
+            ),
+        )
+    }
+
     private fun activeAttempt(levelId: UUID): MutableRiskAttempt {
         val attempt = attempts[levelId]
             ?: error("No admitted attempt exists for level $levelId")
@@ -735,11 +1021,16 @@ class AttemptRiskService internal constructor(
         }
         return GlobalRiskSnapshot(
             observedAt = now,
-            globalTradingState = globalTradingState,
-            stateReason = stateReason,
+            globalTradingState = effectiveGlobalTradingState(now),
+            stateReason = effectiveStateReason(now),
+            dailyAnchorKind = dailyAnchorKind,
+            dailyAnchorEstablishedAt = dailyAnchorEstablishedAt,
+            nextDailyBoundary = nextDailyBoundary,
             dailyAnchorEquity = accountState?.dailyAnchorEquity,
             currentTotalAccountEquity =
                 accountState?.currentTotalAccountEquity,
+            depositsSinceAnchor = accountState?.depositsSinceAnchor,
+            withdrawalsSinceAnchor = accountState?.withdrawalsSinceAnchor,
             dailyLossLimit = lossLimit,
             tradingDrawdown = drawdown,
             reservedRiskForOpenPositions = openRisk,
@@ -757,6 +1048,8 @@ class AttemptRiskService internal constructor(
                 .size,
             safeModeEventCount = safeModeEvents.size,
             safeModeEventTimes = safeModeEvents.toList(),
+            consecutiveLossCount = consecutiveLossCount,
+            entryCooldownUntil = entryCooldownUntil,
             attempts = attempts.values
                 .sortedBy(MutableRiskAttempt::sequence)
                 .map(MutableRiskAttempt::snapshot),
@@ -783,6 +1076,26 @@ class AttemptRiskService internal constructor(
     private fun dailyLossLimit(accountState: RiskAccountState): BigDecimal =
         accountState.dailyAnchorEquity.multiply(DAILY_LOSS_PERCENT)
 
+    private fun effectiveGlobalTradingState(now: Instant): GlobalTradingState =
+        when {
+            manualLockReason != null -> GlobalTradingState.MANUAL_LOCK
+            dailyLockedAt != null -> GlobalTradingState.DAILY_LOCKED
+            safeModeReason != null -> GlobalTradingState.SAFE_MODE
+            entryCooldownUntil?.let(now::isBefore) == true ->
+                GlobalTradingState.ENTRY_COOLDOWN
+
+            else -> GlobalTradingState.RUNNING
+        }
+
+    private fun effectiveStateReason(now: Instant): String? =
+        when (effectiveGlobalTradingState(now)) {
+            GlobalTradingState.RUNNING -> null
+            GlobalTradingState.ENTRY_COOLDOWN -> ENTRY_COOLDOWN_REASON
+            GlobalTradingState.SAFE_MODE -> safeModeReason
+            GlobalTradingState.DAILY_LOCKED -> DAILY_LOCK_REASON
+            GlobalTradingState.MANUAL_LOCK -> manualLockReason
+        }
+
     private fun roundToIncrement(
         value: BigDecimal,
         increment: BigDecimal,
@@ -803,6 +1116,16 @@ private sealed interface RiskEvent {
         val admittedAt: Instant,
     ) : RiskEvent
 
+    data class ObserveDailyAccount(
+        val observation: DailyRiskAccountObservation,
+        val observedAt: Instant,
+    ) : RiskEvent
+
+    data class RecordDailyTransfer(
+        val transfer: DailyRiskTransfer,
+        val recordedAt: Instant,
+    ) : RiskEvent
+
     data class ConfirmedExposure(
         val levelId: UUID,
         val confirmedPositionQuantity: BigDecimal,
@@ -816,6 +1139,7 @@ private sealed interface RiskEvent {
     data class ConfirmedFlat(
         val levelId: UUID,
         val confirmedAt: Instant,
+        val netPnl: BigDecimal?,
     ) : RiskEvent
 
     data class EnterSafeMode(
@@ -841,6 +1165,7 @@ private data class MutableRiskAttempt(
     val admittedAt: Instant,
     var completedAt: Instant?,
     var confirmedPositionQuantity: BigDecimal,
+    var netPnl: BigDecimal?,
     val plan: AttemptRiskPlan,
 ) {
     fun snapshot(): RiskAttemptSnapshot =
@@ -852,6 +1177,7 @@ private data class MutableRiskAttempt(
             admittedAt = admittedAt,
             completedAt = completedAt,
             confirmedPositionQuantity = confirmedPositionQuantity,
+            netPnl = netPnl,
             plan = plan,
         )
 }
@@ -884,13 +1210,42 @@ private data class TakeProfitSpec(
 
 private fun String.normalizedSymbol(): String = trim().uppercase()
 
+private fun nextDailyBoundary(now: Instant): Instant {
+    val utcNow = ZonedDateTime.ofInstant(now, ZoneOffset.UTC)
+    var boundary = utcNow
+        .toLocalDate()
+        .atTime(DAILY_BOUNDARY_HOUR_UTC, 0)
+        .atZone(ZoneOffset.UTC)
+    if (!boundary.toInstant().isAfter(now)) {
+        boundary = boundary.plusDays(1)
+    }
+    return boundary.toInstant()
+}
+
+private fun mostRecentDailyBoundary(now: Instant): Instant {
+    val utcNow = ZonedDateTime.ofInstant(now, ZoneOffset.UTC)
+    var boundary = utcNow
+        .toLocalDate()
+        .atTime(DAILY_BOUNDARY_HOUR_UTC, 0)
+        .atZone(ZoneOffset.UTC)
+    if (boundary.toInstant().isAfter(now)) {
+        boundary = boundary.minusDays(1)
+    }
+    return boundary.toInstant()
+}
+
 private fun emptySnapshot(now: Instant): GlobalRiskSnapshot =
     GlobalRiskSnapshot(
         observedAt = now,
         globalTradingState = GlobalTradingState.RUNNING,
         stateReason = null,
+        dailyAnchorKind = null,
+        dailyAnchorEstablishedAt = null,
+        nextDailyBoundary = null,
         dailyAnchorEquity = null,
         currentTotalAccountEquity = null,
+        depositsSinceAnchor = null,
+        withdrawalsSinceAnchor = null,
         dailyLossLimit = null,
         tradingDrawdown = null,
         reservedRiskForOpenPositions = BigDecimal.ZERO,
@@ -901,6 +1256,8 @@ private fun emptySnapshot(now: Instant): GlobalRiskSnapshot =
         activeAttemptSymbolCount = 0,
         safeModeEventCount = 0,
         safeModeEventTimes = emptyList(),
+        consecutiveLossCount = 0,
+        entryCooldownUntil = null,
         attempts = emptyList(),
         reservations = emptyList(),
     )
@@ -910,7 +1267,19 @@ private const val MAXIMUM_LEVERAGE = 20
 private const val MAXIMUM_ACTIVE_SYMBOLS = 5
 private const val SAFE_MODE_ESCALATION_COUNT = 3
 private const val SAFE_MODE_ESCALATION_REASON = "SAFE_MODE_ESCALATION"
+private const val DAILY_LOCK_REASON = "DAILY_DRAWDOWN_LIMIT"
+private const val ENTRY_COOLDOWN_REASON = "CONSECUTIVE_LOSS_COOLDOWN"
+private const val TEMPORARY_ANCHOR_DECISION =
+    "TEMPORARY_RESTART_ANCHOR_ESTABLISHED"
+private const val DAILY_ROLLOVER_DECISION = "DAILY_ANCHOR_ROLLED_OVER"
+private const val DAILY_BREACH_DECISION = "DAILY_DRAWDOWN_BREACHED"
+private const val ENTRY_COOLDOWN_DECISION = "ENTRY_COOLDOWN_STARTED"
+private const val GLOBAL_RISK_AUDIT_SYMBOL = "ACCOUNT"
+private const val DAILY_BOUNDARY_HOUR_UTC = 3
+private const val CONSECUTIVE_LOSS_LIMIT = 3
+private val GLOBAL_RISK_AUDIT_LEVEL_ID = UUID(0L, 0L)
 private val SAFE_MODE_ROLLING_WINDOW: Duration = Duration.ofMinutes(15)
+private val ENTRY_COOLDOWN_DURATION: Duration = Duration.ofMinutes(15)
 private val ONE_HUNDRED = BigDecimal("100")
 private val THREE = BigDecimal("3")
 private val ONE_PERCENT = BigDecimal("0.01")

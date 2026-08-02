@@ -12,6 +12,7 @@ import com.scalpsecta.breakoutbot.level.LevelDirection
 import com.scalpsecta.breakoutbot.level.LevelReasonCode
 import com.scalpsecta.breakoutbot.level.LevelService
 import com.scalpsecta.breakoutbot.level.LevelSnapshot
+import com.scalpsecta.breakoutbot.risk.AttemptRiskService
 import org.springframework.stereotype.Service
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
@@ -82,6 +83,12 @@ interface SafeModeExecutionGateway {
         reconciliation: SignedRuntimeReconciliation,
         operationId: String,
     ): Mono<Void>
+
+    fun flattenAllAccountExposure(
+        reconciliation: SignedRuntimeReconciliation,
+        operationId: String,
+        terminalReason: LevelReasonCode,
+    ): Mono<Void> = flattenAllAccountExposure(reconciliation, operationId)
 }
 
 @Service
@@ -90,6 +97,7 @@ class LiveSafeModeExecutionGateway(
     private val levelService: LevelService,
     private val breakoutExecutionService: BreakoutExecutionService,
     private val authenticatedBinanceClient: AuthenticatedBinanceClient,
+    private val riskService: AttemptRiskService,
 ) : SafeModeExecutionGateway {
     override fun runtimeSymbols(): Set<String> =
         levels().mapTo(sortedSetOf(), LevelSnapshot::symbol)
@@ -203,6 +211,26 @@ class LiveSafeModeExecutionGateway(
     override fun flattenAllAccountExposure(
         reconciliation: SignedRuntimeReconciliation,
         operationId: String,
+    ): Mono<Void> = flattenAccountExposure(
+        reconciliation = reconciliation,
+        operationId = operationId,
+        terminalReason = null,
+    )
+
+    override fun flattenAllAccountExposure(
+        reconciliation: SignedRuntimeReconciliation,
+        operationId: String,
+        terminalReason: LevelReasonCode,
+    ): Mono<Void> = flattenAccountExposure(
+        reconciliation = reconciliation,
+        operationId = operationId,
+        terminalReason = terminalReason,
+    )
+
+    private fun flattenAccountExposure(
+        reconciliation: SignedRuntimeReconciliation,
+        operationId: String,
+        terminalReason: LevelReasonCode?,
     ): Mono<Void> {
         val execution = checkNotNull(reconciliation.execution) {
             "Live account flattening requires an execution reconciliation"
@@ -212,12 +240,20 @@ class LiveSafeModeExecutionGateway(
                 openOrders = execution.openBotOrders,
                 retainHardStops = true,
             )
-            .then(
-                executionService.closeAccountPositions(
-                    reconciledPositions = reconciliation.positions,
-                    operationId = operationId,
-                ),
-            )
+            .flatMap { canceled ->
+                if (!canceled) {
+                    Mono.error(
+                        IllegalStateException(
+                            "Could not cancel every non-stop bot order",
+                        ),
+                    )
+                } else {
+                    executionService.closeAccountPositions(
+                        reconciledPositions = reconciliation.positions,
+                        operationId = operationId,
+                    )
+                }
+            }
             .flatMap { resolutions ->
                 val accountFlat = resolutions.all { resolution ->
                     resolution.confirmedPositionAmount.signum() == 0
@@ -226,11 +262,63 @@ class LiveSafeModeExecutionGateway(
                     executionService.cancelBotOrders(
                         openOrders = execution.openBotOrders,
                         retainHardStops = false,
-                    ).then()
+                    ).flatMap { canceled ->
+                        if (!canceled) {
+                            Mono.error(
+                                IllegalStateException(
+                                    "Could not cancel protective hard stops",
+                                ),
+                            )
+                        } else if (terminalReason == null) {
+                            Mono.empty()
+                        } else {
+                            synchronizeDailyFlat(terminalReason)
+                        }
+                    }
                 } else {
                     Mono.empty()
                 }
             }
+    }
+
+    private fun synchronizeDailyFlat(
+        terminalReason: LevelReasonCode,
+    ): Mono<Void> {
+        val levelsById = levels().associateBy(LevelSnapshot::id)
+        val activeAttemptIds = riskService
+            .currentState()
+            .reservations
+            .map { reservation -> reservation.levelId }
+        return Flux
+            .fromIterable(activeAttemptIds)
+            .concatMap { levelId ->
+                Mono.defer {
+                    if (
+                        riskService.currentState().reservations.none {
+                            reservation -> reservation.levelId == levelId
+                        }
+                    ) {
+                        return@defer Mono.empty()
+                    }
+                    val netResult = executionService.positionResult(levelId)
+                    val terminateLevel = levelsById[levelId]?.let {
+                        levelService.terminatePosition(
+                            levelId = levelId,
+                            reason = terminalReason,
+                            confirmedRemainingQuantity = BigDecimal.ZERO,
+                            hasUnresolvedOrder = false,
+                            netResult = netResult,
+                        )
+                    } ?: Mono.empty()
+                    terminateLevel.then(
+                        riskService.recordConfirmedFlat(
+                            levelId = levelId,
+                            netPnl = netResult?.netPnl,
+                        ),
+                    )
+                }
+            }
+            .then()
     }
 
     private fun levels(): List<LevelSnapshot> = levelService.currentState()

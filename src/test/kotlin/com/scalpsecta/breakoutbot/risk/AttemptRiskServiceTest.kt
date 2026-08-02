@@ -10,15 +10,19 @@ import reactor.core.publisher.Mono
 import reactor.core.scheduler.Schedulers
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 class AttemptRiskServiceTest {
     private val now = Instant.parse("2026-08-01T12:00:00Z")
+    private val clock = MutableRiskClock(now)
     private val scheduler = Schedulers.newSingle("attempt-risk-test")
     private val service = AttemptRiskService(
-        clock = Clock.fixed(now, ZoneOffset.UTC),
+        clock = clock,
         scheduler = scheduler,
     )
 
@@ -310,6 +314,160 @@ class AttemptRiskServiceTest {
             .containsExactly(RiskBlockerCode.BLOCKED_DAILY_RISK)
     }
 
+    @Test
+    fun `labels the startup anchor as temporary until the next utc boundary`() {
+        val evaluation = service.observeDailyAccount(
+            DailyRiskAccountObservation(
+                totalAccountEquity = BigDecimal("1000"),
+                availableMargin = BigDecimal("900"),
+            ),
+        ).block()!!
+
+        assertThat(evaluation.startupAnchorEstablished).isTrue()
+        assertThat(evaluation.state.dailyAnchorKind)
+            .isEqualTo(DailyAnchorKind.TEMPORARY_RESTART)
+        assertThat(evaluation.state.dailyAnchorEstablishedAt).isEqualTo(now)
+        assertThat(evaluation.state.nextDailyBoundary)
+            .isEqualTo(Instant.parse("2026-08-02T03:00:00Z"))
+    }
+
+    @Test
+    fun `locks at the exact five percent drawdown boundary`() {
+        service.observeDailyAccount(observation(equity = "1000")).block()
+
+        val evaluation = service.observeDailyAccount(
+            observation(equity = "950"),
+        ).block()!!
+
+        assertThat(evaluation.dailyBreachTriggered).isTrue()
+        assertThat(evaluation.state.tradingDrawdown)
+            .isEqualByComparingTo(BigDecimal("50"))
+        assertThat(evaluation.state.globalTradingState)
+            .isEqualTo(GlobalTradingState.DAILY_LOCKED)
+    }
+
+    @Test
+    fun `transfer deltas are removed from monitored trading performance`() {
+        service.observeDailyAccount(observation(equity = "1000")).block()
+        service.recordDailyTransfer(
+            DailyRiskTransfer(
+                deposits = BigDecimal("20"),
+                withdrawals = BigDecimal("5"),
+            ),
+        ).block()
+
+        val evaluation = service.observeDailyAccount(
+            observation(equity = "970"),
+        ).block()!!
+
+        assertThat(evaluation.dailyBreachTriggered).isFalse()
+        assertThat(evaluation.state.tradingDrawdown)
+            .isEqualByComparingTo(BigDecimal("45"))
+        assertThat(evaluation.state.depositsSinceAnchor)
+            .isEqualByComparingTo(BigDecimal("20"))
+        assertThat(evaluation.state.withdrawalsSinceAnchor)
+            .isEqualByComparingTo(BigDecimal("5"))
+    }
+
+    @Test
+    fun `daily rollover preserves open risk and clears a daily lock`() {
+        service.observeDailyAccount(observation(equity = "1000")).block()
+        val levelId = UUID.fromString(
+            "00000000-0000-0000-0000-000000000031",
+        )
+        service.admit(request(levelId = levelId), account()).block()
+        service.recordConfirmedExposure(levelId, BigDecimal("10")).block()
+        service.observeDailyAccount(observation(equity = "950")).block()
+        assertThat(service.currentState().globalTradingState)
+            .isEqualTo(GlobalTradingState.DAILY_LOCKED)
+
+        clock.advance(Duration.ofHours(15))
+        val rollover = service.observeDailyAccount(
+            observation(equity = "940"),
+        ).block()!!
+
+        assertThat(rollover.dailyRollover).isTrue()
+        assertThat(rollover.state.globalTradingState)
+            .isEqualTo(GlobalTradingState.RUNNING)
+        assertThat(rollover.state.dailyAnchorKind)
+            .isEqualTo(DailyAnchorKind.SCHEDULED_03_00_UTC)
+        assertThat(rollover.state.dailyAnchorEstablishedAt)
+            .isEqualTo(Instant.parse("2026-08-02T03:00:00Z"))
+        assertThat(rollover.state.dailyAnchorEquity)
+            .isEqualByComparingTo(BigDecimal("940"))
+        assertThat(rollover.state.reservedRiskForOpenPositions)
+            .isEqualByComparingTo(BigDecimal("10"))
+        assertThat(rollover.state.attempts.single().admittedAt).isEqualTo(now)
+    }
+
+    @Test
+    fun `profitable result resets losses and three later losses cool entries`() {
+        val openLevelId = UUID.fromString(
+            "00000000-0000-0000-0000-000000000040",
+        )
+        service.admit(
+            request(levelId = openLevelId, symbol = "OPENUSDT"),
+            account(),
+        ).block()
+        service.recordConfirmedExposure(openLevelId, BigDecimal("10")).block()
+
+        closeAttempt(41, "-1")
+        closeAttempt(42, "-2")
+        closeAttempt(43, "1")
+        assertThat(service.currentState().consecutiveLossCount).isZero()
+
+        closeAttempt(44, "-1")
+        closeAttempt(45, "-1")
+        val cooled = closeAttempt(46, "-1")
+
+        assertThat(cooled.globalTradingState)
+            .isEqualTo(GlobalTradingState.ENTRY_COOLDOWN)
+        assertThat(cooled.consecutiveLossCount).isEqualTo(3)
+        assertThat(cooled.entryCooldownUntil)
+            .isEqualTo(now.plus(Duration.ofMinutes(15)))
+        assertThat(cooled.reservations.map(RiskReservationSnapshot::levelId))
+            .contains(openLevelId)
+        assertThat(cooled.reservedRiskForOpenPositions)
+            .isEqualByComparingTo(BigDecimal("10"))
+        val blocked = service.admit(
+            request(
+                levelId = UUID.fromString(
+                    "00000000-0000-0000-0000-000000000047",
+                ),
+            ),
+            account(),
+        ).block()!!
+        assertThat(blocked.blockers)
+            .contains(RiskBlockerCode.BLOCKED_ENTRY_COOLDOWN)
+
+        clock.advance(Duration.ofMinutes(15))
+        assertThat(service.currentState().globalTradingState)
+            .isEqualTo(GlobalTradingState.RUNNING)
+    }
+
+    private fun closeAttempt(
+        suffix: Int,
+        netPnl: String,
+    ): GlobalRiskSnapshot {
+        val levelId = UUID.fromString(
+            "00000000-0000-0000-0000-${suffix.toString().padStart(12, '0')}",
+        )
+        service.admit(request(levelId = levelId), account()).block()
+        return service.recordConfirmedFlat(
+            levelId = levelId,
+            netPnl = BigDecimal(netPnl),
+        ).block()!!
+    }
+
+    private fun observation(
+        equity: String,
+        availableMargin: String = "1000",
+    ): DailyRiskAccountObservation =
+        DailyRiskAccountObservation(
+            totalAccountEquity = BigDecimal(equity),
+            availableMargin = BigDecimal(availableMargin),
+        )
+
     private fun request(
         levelId: UUID = UUID.fromString("00000000-0000-0000-0000-000000000001"),
         symbol: String = "BTCUSDT",
@@ -359,4 +517,20 @@ class AttemptRiskServiceTest {
             depositsSinceAnchor = BigDecimal(depositsSinceAnchor),
             withdrawalsSinceAnchor = BigDecimal(withdrawalsSinceAnchor),
         )
+}
+
+private class MutableRiskClock(
+    initialInstant: Instant,
+) : Clock() {
+    private val currentInstant = AtomicReference(initialInstant)
+
+    override fun getZone(): ZoneId = ZoneOffset.UTC
+
+    override fun withZone(zone: ZoneId): Clock = this
+
+    override fun instant(): Instant = currentInstant.get()
+
+    fun advance(duration: Duration) {
+        currentInstant.updateAndGet { instant -> instant.plus(duration) }
+    }
 }

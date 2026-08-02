@@ -302,7 +302,10 @@ class BreakoutExecutionService internal constructor(
             return@defer Mono.empty()
         }
         val riskUpdate = if (reduction.confirmedRemainingQuantity.signum() == 0) {
-            riskService.recordConfirmedFlat(reduction.levelId)
+            riskService.recordConfirmedFlat(
+                levelId = reduction.levelId,
+                netPnl = reduction.netResult?.netPnl,
+            )
         } else {
             riskService.recordConfirmedReducingFill(
                 levelId = reduction.levelId,
@@ -619,7 +622,10 @@ class BreakoutExecutionService internal constructor(
                 Mono.just(riskService.currentState())
 
             remainingQuantity.signum() == 0 ->
-                riskService.recordConfirmedFlat(levelId)
+                riskService.recordConfirmedFlat(
+                    levelId = levelId,
+                    netPnl = orderExecutor.positionResult(levelId)?.netPnl,
+                )
 
             else -> riskService.recordConfirmedReducingFill(
                 levelId = levelId,
