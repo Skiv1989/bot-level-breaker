@@ -66,3 +66,7 @@ tasks.withType<Test>().configureEach {
         events("passed", "skipped", "failed")
     }
 }
+
+tasks.bootJar {
+    archiveFileName.set("application.jar")
+}

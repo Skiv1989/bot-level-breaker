@@ -206,6 +206,44 @@ class OperatorSecurityIntegrationTest {
     }
 
     @Test
+    fun `health keeps HTTPS liveness separate from Binance and trading readiness`() {
+        withHttpsApplication { application ->
+            val unauthenticated = application.get(path = "/api/health/liveness")
+            assertThat(unauthenticated.statusCode()).isEqualTo(401)
+
+            val liveness = application.get(
+                path = "/api/health/liveness",
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(liveness.statusCode()).isEqualTo(200)
+            val liveSnapshot = application.objectMapper.readTree(liveness.body())
+            assertThat(liveSnapshot["process"].asText()).isEqualTo("LIVE")
+            assertThat(liveSnapshot["http"].asText()).isEqualTo("LIVE")
+            assertThat(liveSnapshot.has("tradingReadiness")).isFalse()
+
+            val readiness = application.get(
+                path = "/api/health/readiness",
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(readiness.statusCode()).isEqualTo(200)
+            val readinessSnapshot =
+                application.objectMapper.readTree(readiness.body())
+            assertThat(readinessSnapshot["publicDataReadiness"].asText())
+                .isEqualTo("NOT_READY")
+            assertThat(readinessSnapshot["privateStreamReadiness"].asText())
+                .isEqualTo("NOT_READY")
+            assertThat(readinessSnapshot["clockReadiness"].asText())
+                .isEqualTo("NOT_READY")
+            assertThat(readinessSnapshot["accountReadiness"].asText())
+                .isEqualTo("NOT_READY")
+            assertThat(readinessSnapshot["tradingReadiness"].asText())
+                .isEqualTo("BLOCKED")
+        }
+    }
+
+    @Test
     fun `authenticated browser receives a secure CSRF token and CORS remains disabled`() {
         withHttpsApplication { application ->
             val snapshotResponse = application.getSnapshot(
