@@ -5,6 +5,33 @@ Boot process. It has no Docker Compose dependency, Binance testnet selector, or
 shadow-trading mode. Automated verification uses injected fakes and offline
 replay; the runtime adapters use Binance production endpoints.
 
+## Prove release acceptance
+
+Run the complete release proof from PowerShell with Docker configured for Linux
+containers and both reference repositories available:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+    -File .\scripts\verify-release.ps1 `
+    -LinerStarterSource C:\IdeaProjects\liner-starter `
+    -LinerDtoSource "$env:USERPROFILE\IdeaProjects\liner-dto"
+```
+
+This one command runs the full Gradle suite, verifies that every required test
+layer and PRD §31 area produced JUnit evidence, stages and scans the three
+source snapshots, builds the image, and starts it with a generated certificate
+and mounted audit directory. The container has `--network none`; its HTTPS
+liveness must become healthy while trading readiness remains `BLOCKED`. Gradle
+test workers also install a transport guard whose persistent marker fails the
+test task if live Binance order or account-mutation transport is reached.
+
+The command records before/after fingerprints for `liner-starter` and
+`liner-dto`, uses only conspicuous dummy credentials, removes its generated
+container and default disposable image, and writes the complete result under
+`build/reports/release-acceptance/`. It does not read production credentials.
+See [RELEASE_ACCEPTANCE.md](RELEASE_ACCEPTANCE.md) for the evidence map, stable
+reason catalog, failure semantics, and accepted operational risks.
+
 ## Build the image
 
 Prerequisites are Docker with Linux-container support and readable checkouts of

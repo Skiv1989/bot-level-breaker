@@ -61,7 +61,28 @@ kotlin {
 }
 
 tasks.withType<Test>().configureEach {
+    val liveTradingAttemptMarker = layout.buildDirectory.file(
+        "test-guard/$name-live-binance-trading-attempt.txt",
+    )
+
     useJUnitPlatform()
+    systemProperty(
+        "breakoutbot.test.live-trading-attempt-marker",
+        liveTradingAttemptMarker.get().asFile.absolutePath,
+    )
+    systemProperty("breakoutbot.test.automated-verification", "true")
+    doFirst {
+        liveTradingAttemptMarker.get().asFile.delete()
+    }
+    doLast {
+        val marker = liveTradingAttemptMarker.get().asFile
+        if (marker.isFile) {
+            throw GradleException(
+                "Automated verification attempted a live Binance trading " +
+                    "request; see ${marker.absolutePath}",
+            )
+        }
+    }
     testLogging {
         events("passed", "skipped", "failed")
     }

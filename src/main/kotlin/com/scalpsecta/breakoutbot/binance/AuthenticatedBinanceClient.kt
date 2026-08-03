@@ -743,4 +743,7 @@ internal fun liveBinanceWebClient(builder: WebClient.Builder): WebClient =
     builder
         .baseUrl(LIVE_REST_BASE_URL)
         .defaultHeader(HttpHeaders.USER_AGENT, "breakout-bot/0.1")
+        .filter(
+            AutomatedVerificationBinanceTransportGuard.forGradleTestWorker(),
+        )
         .build()

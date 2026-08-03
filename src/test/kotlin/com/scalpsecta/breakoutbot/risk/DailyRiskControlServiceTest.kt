@@ -62,6 +62,8 @@ class DailyRiskControlServiceTest {
             .containsExactly("BTCUSDT", "UNTRACKEDUSDT")
         assertThat(gateway.operationIds.single())
             .startsWith("daily-lock:")
+        assertThat(gateway.terminalReasons)
+            .containsExactly(LevelReasonCode.DAILY_LOSS_LIMIT)
     }
 }
 
@@ -91,6 +93,7 @@ private class RecordingDailyRiskExecutionGateway(
     var flattenCount = 0
     var flattenedPositions = emptyList<BinancePositionRisk>()
     val operationIds = mutableListOf<String>()
+    val terminalReasons = mutableListOf<LevelReasonCode>()
 
     override fun runtimeSymbols(): Set<String> = setOf("BTCUSDT")
 
@@ -113,6 +116,15 @@ private class RecordingDailyRiskExecutionGateway(
         flattenedPositions = reconciliation.positions
         operationIds += operationId
     }.then()
+
+    override fun flattenAllAccountExposure(
+        reconciliation: SignedRuntimeReconciliation,
+        operationId: String,
+        terminalReason: LevelReasonCode,
+    ): Mono<Void> {
+        terminalReasons += terminalReason
+        return flattenAllAccountExposure(reconciliation, operationId)
+    }
 }
 
 private fun account(equity: String): DailyRiskAccountObservation =

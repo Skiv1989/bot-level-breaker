@@ -15,11 +15,14 @@ import java.util.Enumeration;
 public final class LivenessProbe {
     private static final URI LIVENESS_URI =
         URI.create("https://127.0.0.1:443/api/health/liveness");
+    private static final URI READINESS_URI =
+        URI.create("https://127.0.0.1:443/api/health/readiness");
 
     private LivenessProbe() {
     }
 
     public static void main(String[] arguments) throws Exception {
+        ProbeMode mode = ProbeMode.from(arguments);
         String username = requiredEnvironmentVariable("BOT_BASIC_USERNAME");
         String password = requiredEnvironmentVariable("BOT_BASIC_PASSWORD");
         String keyStorePath = requiredEnvironmentVariable("TLS_KEYSTORE_PATH");
@@ -65,7 +68,7 @@ public final class LivenessProbe {
         sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
 
         HttpsURLConnection connection =
-            (HttpsURLConnection) LIVENESS_URI.toURL().openConnection();
+            (HttpsURLConnection) mode.uri.toURL().openConnection();
         connection.setSSLSocketFactory(sslContext.getSocketFactory());
         HostnameVerifier loopbackVerifier = (host, session) ->
             "127.0.0.1".equals(host);
@@ -81,11 +84,26 @@ public final class LivenessProbe {
         );
         connection.connect();
         int responseCode = connection.getResponseCode();
-        connection.disconnect();
         if (responseCode != 200) {
+            connection.disconnect();
             throw new IllegalStateException(
-                "HTTPS liveness returned status " + responseCode
+                "HTTPS " + mode.description + " returned status " + responseCode
             );
+        }
+        if (mode == ProbeMode.NOT_READY_TRADING) {
+            String response;
+            try (InputStream input = connection.getInputStream()) {
+                response = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+            } finally {
+                connection.disconnect();
+            }
+            if (!response.contains("\"tradingReadiness\":\"BLOCKED\"")) {
+                throw new IllegalStateException(
+                    "HTTPS readiness did not report blocked trading"
+                );
+            }
+        } else {
+            connection.disconnect();
         }
     }
 
@@ -95,5 +113,33 @@ public final class LivenessProbe {
             throw new IllegalStateException(name + " is required");
         }
         return value;
+    }
+
+    private enum ProbeMode {
+        LIVENESS(LIVENESS_URI, "liveness"),
+        NOT_READY_TRADING(READINESS_URI, "readiness");
+
+        private final URI uri;
+        private final String description;
+
+        ProbeMode(URI uri, String description) {
+            this.uri = uri;
+            this.description = description;
+        }
+
+        private static ProbeMode from(String[] arguments) {
+            if (arguments.length == 0) {
+                return LIVENESS;
+            }
+            if (
+                arguments.length == 1 &&
+                "--expect-trading-blocked".equals(arguments[0])
+            ) {
+                return NOT_READY_TRADING;
+            }
+            throw new IllegalArgumentException(
+                "Usage: LivenessProbe [--expect-trading-blocked]"
+            );
+        }
     }
 }
