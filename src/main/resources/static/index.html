@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Breakout Bot Operator Console</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+</head>
+<body>
+<noscript>
+    <div class="noscript">JavaScript is required to operate the bot.</div>
+</noscript>
+
+<header class="topbar">
+    <div>
+        <p class="eyebrow">BINANCE FUTURES</p>
+        <h1>Level Breakout Console</h1>
+    </div>
+    <div class="topbar-status">
+        <span id="global-state" class="badge badge-neutral">LOADING</span>
+        <span id="poll-status" class="poll-status" role="status" aria-live="polite">
+            Connecting…
+        </span>
+    </div>
+</header>
+
+<main>
+    <div id="page-alert" class="alert hidden" role="alert" aria-live="assertive"></div>
+
+    <section class="panel panel-wide" aria-labelledby="system-health-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">LIVE RUNTIME</p>
+                <h2 id="system-health-heading">System health</h2>
+            </div>
+            <span id="trading-readiness" class="badge badge-neutral">UNKNOWN</span>
+        </div>
+        <dl class="metric-grid">
+            <div class="metric">
+                <dt>Public streams</dt>
+                <dd id="public-stream-health">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Private stream</dt>
+                <dd id="private-stream-health">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Market data age</dt>
+                <dd id="market-data-age">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Binance clock</dt>
+                <dd id="clock-health">—</dd>
+            </div>
+            <div class="metric">
+                <dt>SAFE_MODE events</dt>
+                <dd id="safe-mode-count">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Application started</dt>
+                <dd id="application-started">—</dd>
+            </div>
+        </dl>
+    </section>
+
+    <section class="panel panel-wide" aria-labelledby="risk-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">ACCOUNT LIMITS</p>
+                <h2 id="risk-heading">Risk and equity</h2>
+            </div>
+            <span id="risk-reason" class="muted">Waiting for snapshot</span>
+        </div>
+        <dl class="metric-grid risk-grid">
+            <div class="metric featured">
+                <dt>Current equity</dt>
+                <dd id="current-equity">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Daily anchor</dt>
+                <dd id="daily-anchor">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Limit / drawdown</dt>
+                <dd id="daily-limit-drawdown">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Reservations</dt>
+                <dd id="risk-reservations">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Remaining capacity</dt>
+                <dd id="remaining-capacity">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Open / active symbols</dt>
+                <dd id="open-symbol-count">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Consecutive losses</dt>
+                <dd id="loss-streak">—</dd>
+            </div>
+            <div class="metric">
+                <dt>Entry cooldown</dt>
+                <dd id="entry-cooldown">—</dd>
+            </div>
+        </dl>
+    </section>
+
+    <section class="panel" aria-labelledby="add-level-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">OPERATOR INPUT</p>
+                <h2 id="add-level-heading">Add level</h2>
+            </div>
+        </div>
+        <form id="add-level-form" autocomplete="off">
+            <label>
+                Symbol
+                <input name="symbol" type="text" inputmode="text" maxlength="20"
+                       placeholder="BTCUSDT" required spellcheck="false">
+            </label>
+            <label>
+                Direction
+                <select name="direction" required>
+                    <option value="LONG">Long</option>
+                    <option value="SHORT">Short</option>
+                </select>
+            </label>
+            <label>
+                Level price
+                <input name="levelPrice" type="text" inputmode="decimal"
+                       placeholder="101.20" required>
+            </label>
+            <label>
+                Position notional (USDT)
+                <input name="positionNotionalUsdt" type="text" inputmode="decimal"
+                       placeholder="1000" required>
+            </label>
+            <label>
+                Maximum impulse (%)
+                <input name="maxImpulsePct" type="text" inputmode="decimal"
+                       placeholder="2.5" required>
+            </label>
+            <button class="button button-primary" type="submit" data-action-key="add-level">
+                Add level
+            </button>
+            <div id="level-form-error" class="form-error hidden" role="alert"></div>
+        </form>
+    </section>
+
+    <section class="panel controls-panel" aria-labelledby="controls-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">GLOBAL COMMANDS</p>
+                <h2 id="controls-heading">Controls</h2>
+            </div>
+        </div>
+        <div class="control-actions">
+            <button id="kill-button" class="button button-danger" type="button"
+                    data-action-key="kill">
+                Kill trading
+            </button>
+            <p>Cancel bot entries and TPs, close positions, and enter MANUAL_LOCK.</p>
+            <button id="unlock-button" class="button button-secondary" type="button"
+                    data-action-key="unlock" disabled>
+                Unlock bot
+            </button>
+            <p id="unlock-eligibility">Unlock is available only for a healthy, flat manual lock.</p>
+        </div>
+    </section>
+
+    <section class="panel panel-wide" aria-labelledby="levels-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">STRATEGY STATE</p>
+                <h2 id="levels-heading">Levels <span id="level-count" class="count">0</span></h2>
+            </div>
+        </div>
+        <div class="table-scroll">
+            <table>
+                <thead>
+                <tr>
+                    <th scope="col">Symbol / side</th>
+                    <th scope="col">Configuration</th>
+                    <th scope="col">State</th>
+                    <th scope="col">NPU</th>
+                    <th scope="col">Distance</th>
+                    <th scope="col">Mandatory gates</th>
+                    <th scope="col">Blockers</th>
+                    <th scope="col">Terminal reason</th>
+                    <th scope="col">Action</th>
+                </tr>
+                </thead>
+                <tbody id="levels-body"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel panel-wide" aria-labelledby="positions-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">EXCHANGE STATE</p>
+                <h2 id="positions-heading">Positions</h2>
+            </div>
+        </div>
+        <div class="table-scroll">
+            <table>
+                <thead>
+                <tr>
+                    <th scope="col">Symbol</th>
+                    <th scope="col">Actual quantity</th>
+                    <th scope="col">Actual notional</th>
+                    <th scope="col">Weighted entry</th>
+                    <th scope="col">Unrealized PnL</th>
+                    <th scope="col">Hard stop</th>
+                    <th scope="col">Take profits</th>
+                    <th scope="col">Holding deadline</th>
+                    <th scope="col">Action</th>
+                </tr>
+                </thead>
+                <tbody id="positions-body"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel panel-wide" aria-labelledby="orders-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">ORDER LEDGER</p>
+                <h2 id="orders-heading">Orders</h2>
+            </div>
+        </div>
+        <div class="table-scroll">
+            <table>
+                <thead>
+                <tr>
+                    <th scope="col">Symbol</th>
+                    <th scope="col">Role</th>
+                    <th scope="col">Requested</th>
+                    <th scope="col">Filled</th>
+                    <th scope="col">Outcome</th>
+                    <th scope="col">Updated</th>
+                </tr>
+                </thead>
+                <tbody id="orders-body"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel panel-wide" aria-labelledby="recent-heading">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">AUDIT TRAIL</p>
+                <h2 id="recent-heading">Recent activity</h2>
+            </div>
+        </div>
+        <div class="recent-grid">
+            <div>
+                <h3>Decisions</h3>
+                <ol id="recent-decisions" class="event-list"></ol>
+            </div>
+            <div>
+                <h3>Completed results</h3>
+                <ol id="recent-results" class="event-list"></ol>
+            </div>
+            <div>
+                <h3>Errors</h3>
+                <ol id="recent-errors" class="event-list"></ol>
+            </div>
+            <div>
+                <h3>Recovery actions</h3>
+                <ol id="recent-recovery" class="event-list"></ol>
+            </div>
+        </div>
+    </section>
+</main>
+
+<footer>
+    This console uses the browser’s native Basic authentication session and same-origin CSRF protection.
+</footer>
+</body>
+</html>

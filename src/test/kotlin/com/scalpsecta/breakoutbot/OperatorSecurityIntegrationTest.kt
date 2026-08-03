@@ -68,6 +68,66 @@ class OperatorSecurityIntegrationTest {
     }
 
     @Test
+    fun `operator page and static assets use native Basic authentication`() {
+        withHttpsApplication { application ->
+            val challenge = application.get(path = "/")
+
+            assertThat(challenge.statusCode()).isEqualTo(401)
+            assertThat(challenge.headers().firstValue("www-authenticate").orElse(""))
+                .startsWith("Basic")
+
+            val page = application.get(
+                path = "/",
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(page.statusCode()).isEqualTo(200)
+            assertThat(page.headers().firstValue("content-type").orElse(""))
+                .startsWith("text/html")
+            assertThat(page.body())
+                .contains(
+                    "System health",
+                    "Risk and equity",
+                    "Add level",
+                    "Positions",
+                    "Recent activity",
+                    "src=\"/app.js\"",
+                    "href=\"/styles.css\"",
+                )
+                .doesNotContainCredentials()
+
+            val script = application.get(
+                path = "/app.js",
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(script.statusCode()).isEqualTo(200)
+            assertThat(script.headers().firstValue("content-type").orElse(""))
+                .contains("javascript")
+            assertThat(script.body())
+                .contains(
+                    "POLL_INTERVAL_MILLIS = 1000",
+                    "\"/api/snapshot\"",
+                    "CSRF_HEADER_NAME = \"X-XSRF-TOKEN\"",
+                    "credentials: \"same-origin\"",
+                    "state.pendingActions.has(key)",
+                )
+                .doesNotContain("WebSocket", "EventSource", "console.")
+                .doesNotContainCredentials()
+
+            val stylesheet = application.get(
+                path = "/styles.css",
+                username = OPERATOR_USERNAME,
+                password = OPERATOR_PASSWORD,
+            )
+            assertThat(stylesheet.statusCode()).isEqualTo(200)
+            assertThat(stylesheet.headers().firstValue("content-type").orElse(""))
+                .startsWith("text/css")
+            assertThat(stylesheet.body()).doesNotContainCredentials()
+        }
+    }
+
+    @Test
     fun `invalid Basic credentials are rejected without leaking secrets`(
         output: CapturedOutput,
     ) {
@@ -385,9 +445,22 @@ class OperatorSecurityIntegrationTest {
         username: String? = null,
         password: String? = null,
         origin: String? = null,
+    ): HttpResponse<String> =
+        get(
+            path = "/api/snapshot",
+            username = username,
+            password = password,
+            origin = origin,
+        )
+
+    private fun HttpsApplication.get(
+        path: String,
+        username: String? = null,
+        password: String? = null,
+        origin: String? = null,
     ): HttpResponse<String> {
         val request = HttpRequest
-            .newBuilder(baseUri.resolve("/api/snapshot"))
+            .newBuilder(baseUri.resolve(path))
             .GET()
         if (username != null && password != null) {
             request.header("Authorization", basicAuthorization(username, password))

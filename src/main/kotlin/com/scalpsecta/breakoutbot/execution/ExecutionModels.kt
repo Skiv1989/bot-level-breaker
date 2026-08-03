@@ -151,6 +151,8 @@ data class ExecutionPositionSnapshot(
     val positionAmount: BigDecimal,
     val entryPrice: BigDecimal,
     val updatedAt: Instant,
+    val actualNotional: BigDecimal = positionAmount.abs().multiply(entryPrice),
+    val unrealizedPnl: BigDecimal? = null,
 )
 
 data class ExecutionBalanceSnapshot(
@@ -168,6 +170,7 @@ data class OrderExecutionSnapshot(
     val role: OrderRole,
     val slot: Int,
     val requestedQuantity: BigDecimal?,
+    val requestedPrice: BigDecimal?,
     val stopPrice: BigDecimal?,
     val workingType: TriggerWorkingType?,
     val priceProtect: Boolean?,

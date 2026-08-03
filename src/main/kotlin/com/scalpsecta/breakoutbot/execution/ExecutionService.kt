@@ -36,6 +36,7 @@ import java.math.BigDecimal
 import java.nio.charset.StandardCharsets
 import java.time.Clock
 import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -193,11 +194,9 @@ class ExecutionService internal constructor(
                         "Binance position reconciliation returned no position",
                     ),
                 )
-            positions[position.symbol] = ExecutionPositionSnapshot(
-                symbol = position.symbol,
-                positionAmount = position.positionAmount,
-                entryPrice = position.entryPrice,
-                updatedAt = clock.instant(),
+            positions[position.symbol] = position.snapshot(
+                observedAt = clock.instant(),
+                previous = positions[position.symbol],
             )
             Mono.just(position.positionAmount)
         }
@@ -496,11 +495,9 @@ class ExecutionService internal constructor(
             ),
         )
         reconciliation.position?.let { position ->
-            positions[position.symbol] = ExecutionPositionSnapshot(
-                symbol = position.symbol,
-                positionAmount = position.positionAmount,
-                entryPrice = position.entryPrice,
-                updatedAt = clock.instant(),
+            positions[position.symbol] = position.snapshot(
+                observedAt = clock.instant(),
+                previous = positions[position.symbol],
             )
         }
         orders.computeIfPresent(intent.clientOrderId) { _, current ->
@@ -679,11 +676,9 @@ class ExecutionService internal constructor(
         val reconciledPositions = ConcurrentHashMap<String, BinancePositionRisk>()
         account.positions.forEach { position ->
             reconciledPositions[position.symbol] = position
-            positions[position.symbol] = ExecutionPositionSnapshot(
-                symbol = position.symbol,
-                positionAmount = position.positionAmount,
-                entryPrice = position.entryPrice,
-                updatedAt = clock.instant(),
+            positions[position.symbol] = position.snapshot(
+                observedAt = clock.instant(),
+                previous = positions[position.symbol],
             )
         }
         val unknownOrders = orders.values
@@ -698,11 +693,9 @@ class ExecutionService internal constructor(
                     .doOnNext { reconciliation ->
                         reconciliation.position?.let { position ->
                             reconciledPositions[position.symbol] = position
-                            positions[position.symbol] = ExecutionPositionSnapshot(
-                                symbol = position.symbol,
-                                positionAmount = position.positionAmount,
-                                entryPrice = position.entryPrice,
-                                updatedAt = clock.instant(),
+                            positions[position.symbol] = position.snapshot(
+                                observedAt = clock.instant(),
+                                previous = positions[position.symbol],
                             )
                         }
                         val order = reconciliation.order ?: return@doOnNext
@@ -845,11 +838,9 @@ class ExecutionService internal constructor(
             .next()
             .map { check ->
                 val resolution = check.resolution
-                positions[intent.symbol] = ExecutionPositionSnapshot(
-                    symbol = check.position.symbol,
-                    positionAmount = check.position.positionAmount,
-                    entryPrice = check.position.entryPrice,
-                    updatedAt = clock.instant(),
+                positions[intent.symbol] = check.position.snapshot(
+                    observedAt = clock.instant(),
+                    previous = positions[intent.symbol],
                 )
                 orders[intent.clientOrderId] = orders.getValue(intent.clientOrderId).copy(
                     actualFilledQuantity = resolution.actualFilledQuantity,
@@ -1016,11 +1007,9 @@ class ExecutionService internal constructor(
         evaluation: HardStopEvaluation,
     ) {
         reconciliation.position?.let { position ->
-            positions[intent.symbol] = ExecutionPositionSnapshot(
-                symbol = intent.symbol,
-                positionAmount = position.positionAmount,
-                entryPrice = position.entryPrice,
-                updatedAt = clock.instant(),
+            positions[intent.symbol] = position.snapshot(
+                observedAt = clock.instant(),
+                previous = positions[intent.symbol],
             )
         }
         val result = when {
@@ -1282,11 +1271,9 @@ class ExecutionService internal constructor(
         reconciliations.firstNotNullOfOrNull { reconciliation ->
             reconciliation.position
         }?.let { position ->
-            positions[position.symbol] = ExecutionPositionSnapshot(
-                symbol = position.symbol,
-                positionAmount = position.positionAmount,
-                entryPrice = position.entryPrice,
-                updatedAt = clock.instant(),
+            positions[position.symbol] = position.snapshot(
+                observedAt = clock.instant(),
+                previous = positions[position.symbol],
             )
         }
         intents.zip(reconciliations).forEach { (intent, reconciliation) ->
@@ -1695,6 +1682,7 @@ class ExecutionService internal constructor(
             entryPrice =
                 positions[activeSet.symbol]?.entryPrice ?: BigDecimal.ZERO,
             updatedAt = updatedAt,
+            unrealizedPnl = positions[activeSet.symbol]?.unrealizedPnl,
         )
         val complete = remainingQuantity.signum() == 0
         positionReductionSink.tryEmitNext(
@@ -1769,6 +1757,7 @@ class ExecutionService internal constructor(
             positionAmount = remainingPositionAmount,
             entryPrice = positions[event.symbol]?.entryPrice ?: BigDecimal.ZERO,
             updatedAt = event.receivedAt,
+            unrealizedPnl = positions[event.symbol]?.unrealizedPnl,
         )
         val complete = remainingQuantity.signum() == 0
         positionReductionSink.tryEmitNext(
@@ -1808,6 +1797,7 @@ class ExecutionService internal constructor(
                 positionAmount = position.positionAmount,
                 entryPrice = position.entryPrice,
                 updatedAt = event.receivedAt,
+                unrealizedPnl = position.unrealizedProfit,
             )
         }
         recordFunding(event)
@@ -1879,6 +1869,7 @@ class ExecutionService internal constructor(
                 ?: positions[pending.intent.symbol]?.entryPrice
                 ?: BigDecimal.ZERO,
             updatedAt = clock.instant(),
+            unrealizedPnl = positions[pending.intent.symbol]?.unrealizedPnl,
         )
         pending.result.tryEmitValue(resolution)
     }
@@ -2085,7 +2076,7 @@ class ExecutionService internal constructor(
             closePosition = closePosition,
         )
 
-    private fun OrderIntent.snapshot(now: java.time.Instant): OrderExecutionSnapshot =
+    private fun OrderIntent.snapshot(now: Instant): OrderExecutionSnapshot =
         OrderExecutionSnapshot(
             intentSequence = intentSequence,
             clientOrderId = clientOrderId,
@@ -2095,6 +2086,7 @@ class ExecutionService internal constructor(
             role = role,
             slot = slot,
             requestedQuantity = confirmedQuantity,
+            requestedPrice = price,
             stopPrice = stopPrice,
             workingType = workingType,
             priceProtect = priceProtect,
@@ -2104,6 +2096,20 @@ class ExecutionService internal constructor(
             exchangeOrderId = null,
             updatedAt = now,
             reason = null,
+        )
+
+    private fun BinancePositionRisk.snapshot(
+        observedAt: Instant,
+        previous: ExecutionPositionSnapshot?,
+    ): ExecutionPositionSnapshot =
+        ExecutionPositionSnapshot(
+            symbol = symbol,
+            positionAmount = positionAmount,
+            entryPrice = entryPrice,
+            updatedAt = observedAt,
+            actualNotional = notional?.abs()
+                ?: positionAmount.abs().multiply(entryPrice),
+            unrealizedPnl = unrealizedProfit ?: previous?.unrealizedPnl,
         )
 
     private fun OrderIntent.evidence(

@@ -160,7 +160,12 @@ class ExecutionServiceTest {
     fun `immediate fill and account changes resolve from private stream`() {
         val harness = harness()
         harness.client.onPlace = { request ->
-            harness.events.tryEmitNext(accountUpdate(positionAmount = "0.30"))
+            harness.events.tryEmitNext(
+                accountUpdate(
+                    positionAmount = "0.30",
+                    unrealizedProfit = "12.34",
+                ),
+            )
             harness.events.tryEmitNext(
                 orderUpdate(request, status = "FILLED", filledQuantity = "0.30"),
             )
@@ -179,8 +184,12 @@ class ExecutionServiceTest {
         assertThat(resolution.reconciliationChecks).isZero()
         assertThat(harness.client.placements).hasSize(1)
         assertThat(harness.client.reconciliationCounts).isEmpty()
-        assertThat(harness.service.currentState().positions.single().positionAmount)
+        val position = harness.service.currentState().positions.single()
+        assertThat(position.positionAmount)
             .isEqualByComparingTo("0.30")
+        assertThat(position.actualNotional)
+            .isEqualByComparingTo(position.positionAmount.abs().multiply(position.entryPrice))
+        assertThat(position.unrealizedPnl).isEqualByComparingTo("12.34")
         assertThat(harness.service.currentState().balances.single().walletBalance)
             .isEqualByComparingTo("1000")
         assertThat(harness.coordinator.events)
@@ -366,11 +375,18 @@ class ExecutionServiceTest {
             assertThat(placement.reduceOnly).isTrue()
             assertThat(placement.closePosition).isFalse()
         }
-        assertThat(harness.service.currentState().orders)
+        val orderSnapshots = harness.service.currentState().orders
+        assertThat(orderSnapshots)
             .allSatisfy { order ->
                 assertThat(order.role).isEqualTo(OrderRole.TAKE_PROFIT)
                 assertThat(order.outcome).isEqualTo(OrderOutcome.ACTIVE)
             }
+        assertThat(orderSnapshots.map(OrderExecutionSnapshot::requestedPrice))
+            .containsExactly(
+                BigDecimal("100.7"),
+                BigDecimal("101.4"),
+                BigDecimal("102.0"),
+            )
     }
 
     @Test
@@ -985,6 +1001,7 @@ class ExecutionServiceTest {
 
     private fun accountUpdate(
         positionAmount: String,
+        unrealizedProfit: String = "0",
     ): BinanceUserDataEvent.AccountUpdate =
         BinanceUserDataEvent.AccountUpdate(
             eventTime = EVENT_AT,
@@ -1006,7 +1023,7 @@ class ExecutionServiceTest {
                     entryPrice = BigDecimal("100.50"),
                     breakEvenPrice = BigDecimal("100.51"),
                     accumulatedRealizedProfit = BigDecimal.ZERO,
-                    unrealizedProfit = BigDecimal.ZERO,
+                    unrealizedProfit = BigDecimal(unrealizedProfit),
                     marginType = "isolated",
                     isolatedWallet = BigDecimal("10"),
                     positionSide = "BOTH",

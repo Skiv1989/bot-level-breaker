@@ -603,6 +603,8 @@ class LiveAuthenticatedBinanceClient(
                 symbol = symbol,
                 positionAmount = position.requiredDecimal("positionAmt"),
                 entryPrice = position.requiredDecimal("entryPrice"),
+                notional = position.optionalDecimal("notional"),
+                unrealizedProfit = position.optionalDecimal("unRealizedProfit"),
             )
         }
     }
@@ -615,6 +617,8 @@ class LiveAuthenticatedBinanceClient(
             symbol = payload.requiredText("symbol"),
             positionAmount = payload.requiredDecimal("positionAmt"),
             entryPrice = payload.requiredDecimal("entryPrice"),
+            notional = payload.optionalDecimal("notional"),
+            unrealizedProfit = payload.optionalDecimal("unRealizedProfit"),
         )
     }
 

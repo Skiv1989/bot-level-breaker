@@ -71,6 +71,8 @@ data class BinancePositionRisk(
     val symbol: String,
     val positionAmount: BigDecimal,
     val entryPrice: BigDecimal,
+    val notional: BigDecimal? = null,
+    val unrealizedProfit: BigDecimal? = null,
 )
 
 data class BinanceOrderReconciliation(

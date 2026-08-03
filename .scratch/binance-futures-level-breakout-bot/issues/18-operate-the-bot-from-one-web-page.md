@@ -10,11 +10,11 @@
 
 ## Acceptance criteria
 
-- [ ] The page uses static HTML, plain CSS, and vanilla JavaScript with no SPA framework, browser WebSocket, or SSE.
-- [ ] One consolidated REST snapshot is polled every second; overlapping polls do not corrupt displayed state or issue duplicate commands.
-- [ ] System health shows global state, public/private stream health, data age, clock status, SAFE_MODE count, and application start time.
-- [ ] Risk/equity shows current equity, normal or temporary anchor, daily limit/drawdown, reservations/capacity, open-symbol count, loss streak, and cooldown.
-- [ ] The Add Level form exposes the five operator inputs and displays stable backend validation errors; level rows show configuration, state, NPU, distance, gates, blockers, terminal reason, and allowed delete action.
-- [ ] Position/order rows show actual quantity/notional, weighted entry, unrealized PnL, hard stop, TPs, holding deadline, and close action.
-- [ ] Controls expose kill and eligible unlock actions, and the recent section shows decisions, completed results, errors, and recovery actions.
-- [ ] Browser mutations send the valid CSRF token, credentials rely on the native Basic challenge, and sensitive configuration never appears in page content or client logs.
+- [x] The page uses static HTML, plain CSS, and vanilla JavaScript with no SPA framework, browser WebSocket, or SSE.
+- [x] One consolidated REST snapshot is polled every second; overlapping polls do not corrupt displayed state or issue duplicate commands.
+- [x] System health shows global state, public/private stream health, data age, clock status, SAFE_MODE count, and application start time.
+- [x] Risk/equity shows current equity, normal or temporary anchor, daily limit/drawdown, reservations/capacity, open-symbol count, loss streak, and cooldown.
+- [x] The Add Level form exposes the five operator inputs and displays stable backend validation errors; level rows show configuration, state, NPU, distance, gates, blockers, terminal reason, and allowed delete action.
+- [x] Position/order rows show actual quantity/notional, weighted entry, unrealized PnL, hard stop, TPs, holding deadline, and close action.
+- [x] Controls expose kill and eligible unlock actions, and the recent section shows decisions, completed results, errors, and recovery actions.
+- [x] Browser mutations send the valid CSRF token, credentials rely on the native Basic challenge, and sensitive configuration never appears in page content or client logs.

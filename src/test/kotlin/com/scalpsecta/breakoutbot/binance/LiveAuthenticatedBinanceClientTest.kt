@@ -302,7 +302,9 @@ class LiveAuthenticatedBinanceClientTest {
                             "symbol":"BTCUSDT",
                             "positionSide":"BOTH",
                             "positionAmt":"0.180",
-                            "entryPrice":"65432.10"
+                            "entryPrice":"65432.10",
+                            "notional":"11777.778",
+                            "unRealizedProfit":"42.50"
                           },
                           {
                             "symbol":"BTCUSDT",
@@ -344,6 +346,8 @@ class LiveAuthenticatedBinanceClientTest {
         val position = reconciliation.positions.single()
         assertThat(position.symbol).isEqualTo("BTCUSDT")
         assertThat(position.positionAmount).isEqualByComparingTo("0.180")
+        assertThat(position.notional).isEqualByComparingTo("11777.778")
+        assertThat(position.unrealizedProfit).isEqualByComparingTo("42.50")
         assertThat(reconciliation.openOrders.single().clientOrderId)
             .isEqualTo("babc-123-1")
         assertThat(exchange.requests).allSatisfy { request ->
