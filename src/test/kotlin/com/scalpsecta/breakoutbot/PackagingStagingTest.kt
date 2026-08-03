@@ -18,6 +18,23 @@ class PackagingStagingTest {
     lateinit var tempDirectory: Path
 
     @Test
+    fun `Linux image build normalizes Windows Gradle launchers`() {
+        val dockerfile = Files.readString(
+            Path.of(System.getProperty("user.dir")).resolve("Dockerfile"),
+        )
+
+        assertThat(dockerfile)
+            .contains(
+                "sed -i 's/\\r$//'",
+                "/workspace/liner-dto/gradlew",
+                "/workspace/liner-starter/gradlew",
+                "/workspace/bot/gradlew",
+            )
+        assertThat(dockerfile.indexOf("RUN sed -i"))
+            .isLessThan(dockerfile.indexOf("RUN --mount=type=cache"))
+    }
+
+    @Test
     fun `staging copies three immutable source snapshots and excludes sensitive data`() {
         assumeTrue(System.getProperty("os.name").startsWith("Windows"))
         val powershell = Path.of(

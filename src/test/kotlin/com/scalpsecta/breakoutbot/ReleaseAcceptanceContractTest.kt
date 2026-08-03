@@ -4,6 +4,8 @@ import com.scalpsecta.breakoutbot.level.LevelReasonCode
 import com.scalpsecta.breakoutbot.risk.RiskBlockerCode
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import java.nio.file.Files
+import java.nio.file.Path
 
 class ReleaseAcceptanceContractTest {
     @Test
@@ -15,6 +17,30 @@ class ReleaseAcceptanceContractTest {
 
         assertThat(availableCodes).containsAll(PRD_STABLE_REASON_CODES)
     }
+
+    @Test
+    fun `release evidence supports blank separator lines on failure`() {
+        val verificationScript = releaseVerificationScript()
+
+        assertThat(verificationScript)
+            .contains("[AllowEmptyString()]", "Write-Evidence \"\"")
+    }
+
+    @Test
+    fun `release verification expands Docker mount arrays`() {
+        assertThat(releaseVerificationScript())
+            .contains("\$mounts = \$mountJson | ConvertFrom-Json")
+            .doesNotContain("\$mounts = @(\$mountJson | ConvertFrom-Json)")
+    }
+
+    private fun releaseVerificationScript(): String =
+        Files.readString(
+            Path.of(
+                System.getProperty("user.dir"),
+                "scripts",
+                "verify-release.ps1",
+            ),
+        )
 }
 
 private val PRD_STABLE_REASON_CODES = setOf(

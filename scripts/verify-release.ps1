@@ -132,7 +132,11 @@ $beforeRepositories = $null
 $failure = $null
 
 function Write-Evidence {
-    param([Parameter(Mandatory = $true)][string] $Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Message
+    )
 
     Write-Host $Message
     $evidence.Add($Message)
@@ -422,7 +426,7 @@ function Assert-ContainerIsolationAndMounts {
     if ($LASTEXITCODE -ne 0) {
         throw "Could not inspect release-acceptance mounts"
     }
-    $mounts = @($mountJson | ConvertFrom-Json)
+    $mounts = $mountJson | ConvertFrom-Json
     $certificateMount = $mounts | Where-Object {
         $_.Destination -eq "/run/tls/release-test.p12"
     } | Select-Object -First 1

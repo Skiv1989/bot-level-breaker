@@ -9,7 +9,11 @@ COPY liner-dto/ /workspace/liner-dto/
 COPY liner-starter/ /workspace/liner-starter/
 COPY bot/ /workspace/bot/
 
-RUN chmod +x \
+RUN sed -i 's/\r$//' \
+        /workspace/liner-dto/gradlew \
+        /workspace/liner-starter/gradlew \
+        /workspace/bot/gradlew \
+    && chmod +x \
         /workspace/liner-dto/gradlew \
         /workspace/liner-starter/gradlew \
         /workspace/bot/gradlew
