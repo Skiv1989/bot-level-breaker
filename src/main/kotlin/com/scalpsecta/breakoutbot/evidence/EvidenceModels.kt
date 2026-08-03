@@ -154,6 +154,8 @@ data class AttemptEvidenceEvent(
     val stateChange: AttemptStateChange? = null,
     val orderIntent: OrderEvidence? = null,
     val reconciliation: ReconciliationEvidence? = null,
+    val timer: TimerEvidence? = null,
+    val command: CommandEvidence? = null,
 )
 
 enum class AttemptEvidenceEventType {
@@ -165,6 +167,8 @@ enum class AttemptEvidenceEventType {
     PRIVATE_ACCOUNT,
     PRIVATE_LISTEN_KEY_EXPIRED,
     RECONCILIATION,
+    TIMER,
+    COMMAND,
 }
 
 data class AttemptStateChange(
@@ -182,6 +186,17 @@ data class ReconciliationEvidence(
     val requestedQuantity: BigDecimal? = null,
     val filledQuantity: BigDecimal? = null,
     val safeDetail: String? = null,
+)
+
+data class TimerEvidence(
+    val publicMarketDataHealthy: Boolean,
+    val privateStreamHealthy: Boolean,
+)
+
+data class CommandEvidence(
+    val commandId: UUID,
+    val type: String,
+    val symbol: String?,
 )
 
 data class EvidenceSnapshot(

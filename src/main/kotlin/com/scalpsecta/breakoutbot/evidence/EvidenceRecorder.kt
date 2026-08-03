@@ -56,6 +56,18 @@ interface EvidenceRecorder {
         reconciliation: ReconciliationEvidence,
     )
 
+    fun recordTimer(
+        symbol: String,
+        timestamp: Instant,
+        publicMarketDataHealthy: Boolean,
+        privateStreamHealthy: Boolean,
+    ) = Unit
+
+    fun recordCommand(
+        timestamp: Instant,
+        command: CommandEvidence,
+    ) = Unit
+
     fun completeAttempt(levelId: UUID, symbol: String, completedAt: Instant)
 
     fun discardRollingBuffer(symbol: String)
@@ -109,6 +121,18 @@ object NoOpEvidenceRecorder : EvidenceRecorder {
         symbol: String,
         timestamp: Instant,
         reconciliation: ReconciliationEvidence,
+    ) = Unit
+
+    override fun recordTimer(
+        symbol: String,
+        timestamp: Instant,
+        publicMarketDataHealthy: Boolean,
+        privateStreamHealthy: Boolean,
+    ) = Unit
+
+    override fun recordCommand(
+        timestamp: Instant,
+        command: CommandEvidence,
     ) = Unit
 
     override fun completeAttempt(

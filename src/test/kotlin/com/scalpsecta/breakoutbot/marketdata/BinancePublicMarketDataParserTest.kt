@@ -70,6 +70,32 @@ class BinancePublicMarketDataParserTest {
     }
 
     @Test
+    fun `recorded duplicate and ID gap fixtures drive continuity detection`() {
+        val first = requireNotNull(
+            parseAggregateTrade("agg-trade-aggressive-buy.json"),
+        )
+        val duplicate = requireNotNull(
+            parseAggregateTrade("agg-trade-aggressive-buy.json"),
+        )
+        val next = requireNotNull(
+            parseAggregateTrade("agg-trade-aggressive-sell.json"),
+        )
+        val gap = requireNotNull(parseAggregateTrade("agg-trade-id-gap.json"))
+        val continuity = AggregateTradeContinuity()
+
+        assertThat(continuity.observe(first.aggregateTradeId))
+            .isEqualTo(AggregateTradeObservation.ACCEPTED)
+        assertThat(continuity.observe(duplicate.aggregateTradeId))
+            .isEqualTo(AggregateTradeObservation.DUPLICATE)
+        assertThat(continuity.observe(next.aggregateTradeId))
+            .isEqualTo(AggregateTradeObservation.ACCEPTED)
+        assertThat(continuity.observe(gap.aggregateTradeId))
+            .isEqualTo(AggregateTradeObservation.ACCEPTED)
+        assertThat(continuity.gapStatus())
+            .isEqualTo(AggregateTradeGapStatus.GAP_DETECTED)
+    }
+
+    @Test
     fun `bot adapters extend starter reactive Binance infrastructure`() {
         assertThat(DetailedAggTradeBinanceWebSocket(clock = clock))
             .isInstanceOf(BinanceWebSocketReactive::class.java)

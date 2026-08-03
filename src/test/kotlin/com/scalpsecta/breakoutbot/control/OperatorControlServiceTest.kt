@@ -1,6 +1,8 @@
 package com.scalpsecta.breakoutbot.control
 
 import com.scalpsecta.breakoutbot.binance.BinancePositionRisk
+import com.scalpsecta.breakoutbot.evidence.CommandEvidence
+import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
 import com.scalpsecta.breakoutbot.evidence.NoOpEvidenceRecorder
 import com.scalpsecta.breakoutbot.failure.SignedRuntimeReconciliation
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
@@ -26,11 +28,12 @@ class OperatorControlServiceTest {
         evidenceRecorder = NoOpEvidenceRecorder,
     )
     private val gateway = FakeOperatorControlExecutionGateway()
+    private val evidenceRecorder = RecordingCommandEvidenceRecorder()
     private val service = OperatorControlService(
         clock = CLOCK,
         riskService = riskService,
         executionGateway = gateway,
-        evidenceRecorder = NoOpEvidenceRecorder,
+        evidenceRecorder = evidenceRecorder,
     )
 
     @AfterEach
@@ -55,6 +58,13 @@ class OperatorControlServiceTest {
             .isEqualTo(GlobalTradingState.MANUAL_LOCK)
         assertThat(gateway.flattenCount).isOne()
         assertThat(service.currentState().commands).containsExactly(first)
+        assertThat(evidenceRecorder.commands).containsExactly(
+            NOW to CommandEvidence(
+                commandId = commandId,
+                type = "KILL_SWITCH",
+                symbol = null,
+            ),
+        )
     }
 
     @Test
@@ -89,6 +99,15 @@ class OperatorControlServiceTest {
         assertThat(gateway.reconciliationCount).isEqualTo(3)
         assertThat(riskService.currentState().globalTradingState)
             .isEqualTo(GlobalTradingState.RUNNING)
+    }
+}
+
+private class RecordingCommandEvidenceRecorder :
+    EvidenceRecorder by NoOpEvidenceRecorder {
+    val commands = mutableListOf<Pair<Instant, CommandEvidence>>()
+
+    override fun recordCommand(timestamp: Instant, command: CommandEvidence) {
+        commands += timestamp to command
     }
 }
 

@@ -208,7 +208,7 @@ class EvidenceService(
             receivedAt = event.receivedAt,
             aggregateTrade = event,
         )
-        val targets = recordPublicEvent(evidenceEvent)
+        val targets = recordBufferedEvent(evidenceEvent)
         targets.forEach { levelId ->
             writer.appendAttempt(levelId, evidenceEvent.copy(levelId = levelId))
         }
@@ -236,7 +236,7 @@ class EvidenceService(
             receivedAt = event.receivedAt,
             bookTicker = event,
         )
-        val targets = recordPublicEvent(evidenceEvent)
+        val targets = recordBufferedEvent(evidenceEvent)
         targets.forEach { levelId ->
             writer.appendAttempt(levelId, evidenceEvent.copy(levelId = levelId))
         }
@@ -356,6 +356,54 @@ class EvidenceService(
         )
     }
 
+    override fun recordTimer(
+        symbol: String,
+        timestamp: Instant,
+        publicMarketDataHealthy: Boolean,
+        privateStreamHealthy: Boolean,
+    ) {
+        val evidenceEvent = attemptEvent(
+            timestamp = timestamp,
+            symbol = symbol,
+            eventType = AttemptEvidenceEventType.TIMER,
+            timer = TimerEvidence(
+                publicMarketDataHealthy = publicMarketDataHealthy,
+                privateStreamHealthy = privateStreamHealthy,
+            ),
+        )
+        val targets = recordBufferedEvent(evidenceEvent)
+        targets.forEach { levelId ->
+            writer.appendAttempt(levelId, evidenceEvent.copy(levelId = levelId))
+        }
+    }
+
+    override fun recordCommand(
+        timestamp: Instant,
+        command: CommandEvidence,
+    ) {
+        val normalizedSymbol = command.symbol?.normalizedSymbol()
+        val baseEvent = attemptEvent(
+            timestamp = timestamp,
+            symbol = normalizedSymbol.orEmpty(),
+            eventType = AttemptEvidenceEventType.COMMAND,
+            command = command.copy(symbol = normalizedSymbol),
+        )
+        val targets = lock.withLock {
+            closeExpiredLocked(timestamp)
+            activeAttempts.values
+                .filter { attempt ->
+                    normalizedSymbol == null || attempt.symbol == normalizedSymbol
+                }
+                .map { attempt -> attempt.levelId to attempt.symbol }
+        }
+        targets.forEach { (levelId, symbol) ->
+            writer.appendAttempt(
+                levelId,
+                baseEvent.copy(levelId = levelId, symbol = symbol),
+            )
+        }
+    }
+
     override fun completeAttempt(
         levelId: UUID,
         symbol: String,
@@ -447,7 +495,7 @@ class EvidenceService(
         writer.startAttempt(levelId, normalizedSymbol, startedAt, initialEvents)
     }
 
-    private fun recordPublicEvent(event: AttemptEvidenceEvent): List<UUID> =
+    private fun recordBufferedEvent(event: AttemptEvidenceEvent): List<UUID> =
         lock.withLock {
             val symbol = event.symbol.normalizedSymbol()
             closeExpiredLocked(event.timestamp)
@@ -504,6 +552,8 @@ class EvidenceService(
         stateChange: AttemptStateChange? = null,
         orderIntent: OrderEvidence? = null,
         reconciliation: ReconciliationEvidence? = null,
+        timer: TimerEvidence? = null,
+        command: CommandEvidence? = null,
     ): AttemptEvidenceEvent =
         AttemptEvidenceEvent(
             eventId = UUID.randomUUID(),
@@ -521,6 +571,8 @@ class EvidenceService(
             stateChange = stateChange,
             orderIntent = orderIntent,
             reconciliation = reconciliation,
+            timer = timer,
+            command = command,
         )
 
     private fun <T> trimToLimit(values: ArrayDeque<T>, limit: Int) {

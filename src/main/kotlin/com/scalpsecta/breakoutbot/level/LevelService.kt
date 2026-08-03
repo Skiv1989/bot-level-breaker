@@ -67,6 +67,7 @@ class LevelService internal constructor(
                 .snapshots()
                 .firstOrNull { snapshot -> snapshot.symbol == symbol }
         },
+    private val levelIdFactory: () -> UUID = UUID::randomUUID,
 ) : PreEntryLevelCoordinator, BreakoutLevelCoordinator {
     @Autowired
     constructor(
@@ -708,6 +709,13 @@ class LevelService internal constructor(
                 }
 
                 is SymbolLevelEvent.Timer -> {
+                    evidenceRecorder.recordTimer(
+                        symbol = symbol,
+                        timestamp = event.processedAt,
+                        publicMarketDataHealthy = event.marketHealthy,
+                        privateStreamHealthy =
+                            privateStreamReadinessProvider() == BinanceReadiness.READY,
+                    )
                     evidenceRecorder.advance(event.processedAt)
                     levelsForSymbol(symbol).forEach { stored ->
                         val before = stored.snapshot
@@ -773,7 +781,7 @@ class LevelService internal constructor(
             now = event.processedAt,
         )
         val snapshot = LevelSnapshot(
-            id = UUID.randomUUID(),
+            id = levelIdFactory(),
             createdAt = event.processedAt,
             symbol = event.plan.input.symbol,
             direction = event.plan.input.direction,

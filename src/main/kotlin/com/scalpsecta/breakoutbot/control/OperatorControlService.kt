@@ -2,6 +2,7 @@ package com.scalpsecta.breakoutbot.control
 
 import com.scalpsecta.breakoutbot.evidence.AuditEventType
 import com.scalpsecta.breakoutbot.evidence.AuditRecordDraft
+import com.scalpsecta.breakoutbot.evidence.CommandEvidence
 import com.scalpsecta.breakoutbot.evidence.EvidenceRecorder
 import com.scalpsecta.breakoutbot.failure.SignedRuntimeReconciliation
 import com.scalpsecta.breakoutbot.level.GlobalTradingState
@@ -104,6 +105,14 @@ class OperatorControlService(
         )
         snapshots[commandId] = initial
         recordCommandAudit(initial)
+        evidenceRecorder.recordCommand(
+            timestamp = requestedAt,
+            command = CommandEvidence(
+                commandId = commandId,
+                type = type.name,
+                symbol = symbol,
+            ),
+        )
 
         val execution = if (globallyOrdered) {
             globalQueue.submit(action)

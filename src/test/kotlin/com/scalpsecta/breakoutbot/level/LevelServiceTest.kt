@@ -39,6 +39,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class LevelServiceTest {
@@ -50,12 +51,14 @@ class LevelServiceTest {
         clock = clock,
     )
     private val evidenceRecorder = RecordingEvidenceRecorder()
+    private val levelSequence = AtomicLong()
     private val service = LevelService(
         client = client,
         publicMarketDataService = marketDataService,
         clock = clock,
         automaticTimers = false,
         evidenceRecorder = evidenceRecorder,
+        levelIdFactory = { UUID(0, levelSequence.incrementAndGet()) },
     )
 
     @AfterEach
@@ -385,6 +388,10 @@ class LevelServiceTest {
         assertThat(armed.warmupHealthySince)
             .isEqualTo(clock.instant().minusSeconds(10))
         assertThat(armed.blockers).doesNotContain(LevelBlocker.WARMING_UP)
+        assertThat(evidenceRecorder.timers.map(RecordedTimer::publicHealthy))
+            .containsExactly(true, false, true, true, true)
+        assertThat(evidenceRecorder.timers.map(RecordedTimer::privateHealthy))
+            .containsOnly(false)
     }
 
     @Test
@@ -790,6 +797,7 @@ class LevelServiceTest {
 
 private class RecordingEvidenceRecorder : EvidenceRecorder by NoOpEvidenceRecorder {
     val transitions = mutableListOf<RecordedTransition>()
+    val timers = mutableListOf<RecordedTimer>()
 
     override fun recordStateTransition(
         before: LevelSnapshot,
@@ -799,12 +807,33 @@ private class RecordingEvidenceRecorder : EvidenceRecorder by NoOpEvidenceRecord
     ) {
         transitions += RecordedTransition(before.state, after.state, decision)
     }
+
+    override fun recordTimer(
+        symbol: String,
+        timestamp: Instant,
+        publicMarketDataHealthy: Boolean,
+        privateStreamHealthy: Boolean,
+    ) {
+        timers += RecordedTimer(
+            symbol = symbol,
+            timestamp = timestamp,
+            publicHealthy = publicMarketDataHealthy,
+            privateHealthy = privateStreamHealthy,
+        )
+    }
 }
 
 private data class RecordedTransition(
     val before: LevelState,
     val after: LevelState,
     val decision: String,
+)
+
+private data class RecordedTimer(
+    val symbol: String,
+    val timestamp: Instant,
+    val publicHealthy: Boolean,
+    val privateHealthy: Boolean,
 )
 
 private object EmptyMarketDataStreamProvider : PublicMarketDataStreamProvider {

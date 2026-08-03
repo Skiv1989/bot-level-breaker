@@ -89,6 +89,22 @@ class EvidenceServiceTest {
                 filledQuantity = BigDecimal("0.010"),
             ),
         )
+        evidence.recordTimer(
+            symbol = SYMBOL,
+            timestamp = startedAt.plusSeconds(12).plusMillis(4),
+            publicMarketDataHealthy = false,
+            privateStreamHealthy = true,
+        )
+        evidence.recordCommand(
+            timestamp = startedAt.plusSeconds(12).plusMillis(5),
+            command = CommandEvidence(
+                commandId = UUID.fromString(
+                    "99999999-9999-9999-9999-999999999999",
+                ),
+                type = "MANUAL_CLOSE",
+                symbol = SYMBOL.lowercase(),
+            ),
+        )
         evidence.completeAttempt(levelId, SYMBOL, startedAt.plusSeconds(12))
         evidence.record(trade(4, startedAt.plusSeconds(22)))
         evidence.record(trade(5, startedAt.plusSeconds(22).plusMillis(1)))
@@ -107,7 +123,17 @@ class EvidenceServiceTest {
                 "PRIVATE_ORDER",
                 "ORDER_INTENT",
                 "RECONCILIATION",
+                "TIMER",
+                "COMMAND",
             )
+        assertThat(
+            records.single { record -> record["eventType"].asText() == "TIMER" }
+                ["timer"]["publicMarketDataHealthy"].asBoolean(),
+        ).isFalse()
+        assertThat(
+            records.single { record -> record["eventType"].asText() == "COMMAND" }
+                ["command"]["symbol"].asText(),
+        ).isEqualTo(SYMBOL)
         assertThat(records.map { record -> record["sequence"].asLong() })
             .isSorted()
         assertThat(records.map { record -> record["levelId"].asText() })
